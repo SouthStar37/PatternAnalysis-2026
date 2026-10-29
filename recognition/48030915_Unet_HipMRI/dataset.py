@@ -169,22 +169,74 @@ def crop_or_pad(arr, shape, fill=0):
 
 # ---- leakage-free splitting -----
 
-# split_cases(root) -> {split: [case ids]} read from the provided folders
-#   - the provided 2D split is already by patient (31 / 4 / 3 cases)
-#   - check_no_leakage(split_cases(root)) passes
+def split_cases(root=DATA_ROOT):
+    """Case (patient) IDs in each provided 2D split, read from the filenames."""
+    out = {}
+    for split, (img_dir, _) in SPLITS_2D.items():
+        files = (Path(root) / SLICE_DIR / img_dir).glob("*.nii*")
+        out[split] = sorted({parse_key(p.name)[0] for p in files})
+    return out
 
-# patient_level_split(case_ids, val_frac, test_frac, seed) -> new random split by patient
 
-# prostate_sampler(weight) -> WeightedRandomSampler drawing prostate slices `weight` x more often
-#   - only ~36% of slices contain prostate
+def patient_level_split(case_ids, val_frac=0.15, test_frac=0.15, seed=42):
+    """Randomly assign WHOLE patients to train/validate/test (optional alternative split)."""
+
+    cases = sorted(set(case_ids))
+    np.random.default_rng(seed).shuffle(cases)
+    n_test = max(1, round(test_frac * len(cases)))
+    n_val = max(1, round(val_frac * len(cases)))
+    split = {"test": sorted(cases[:n_test]),
+             "validate": sorted(cases[n_test:n_test + n_val]),
+             "train": sorted(cases[n_test + n_val:])}
+    check_no_leakage(split)
+
+    return split
+
+
+def prostate_sampler(dataset, weight=3.0, seed=0):
+    """Sampler that draws slices containing prostate `weight` times more often.
+    Only ~36% of slices contain prostate, so without this most batches barely show it."""
+    w = np.where(dataset.has_prostate, weight, 1.0)
+    g = torch.Generator().manual_seed(seed)
+
+    return WeightedRandomSampler(torch.as_tensor(w, dtype=torch.double), len(w), replacement=True, generator=g)
 
 # ---- data augmentation -----
 
-# augment_2d(x, y)
-#   - random rotation and scaling
-#   - brightness / contrast / small Gaussian noise 
-#   - NO flips: the slices are not axial, so a flip would put the rectum in front of the prostate
+def augment_2d(images, labels, max_rotation_degrees=10.0, scale_range=(0.9, 1.1), spatial_probability=0.5,
+               max_brightness_shift=0.1, contrast_range=(0.9, 1.1), noise_strength=0.03):
 
+    batch_size, _, height, width = images.shape
+    device = images.device
+
+    apply_spatial = torch.rand(batch_size, device=device) < spatial_probability
+
+    angle = (torch.rand(batch_size, device=device) * 2 - 1) * math.radians(max_rotation_degrees)
+    angle = angle * apply_spatial
+
+    random_scale = torch.empty(batch_size, device=device).uniform_(*scale_range)
+    scale = torch.where(apply_spatial, random_scale, torch.ones(batch_size, device=device))
+
+    cos_term = torch.cos(angle) / scale
+    sin_term = torch.sin(angle) / scale
+
+    transform = torch.zeros(batch_size, 2, 3, device=device)   # one 2x3 matrix per image
+    transform[:, 0, 0] = cos_term
+    transform[:, 0, 1] = -sin_term * height / width
+    transform[:, 1, 0] = sin_term * width / height
+    transform[:, 1, 1] = cos_term
+
+    sampling_grid = F.affine_grid(transform, images.shape, align_corners=False)
+    images = F.grid_sample(images, sampling_grid, mode="bilinear", padding_mode="border", align_corners=False)
+    labels = F.grid_sample(labels.unsqueeze(1).float(), sampling_grid, mode="nearest", padding_mode="border",
+                           align_corners=False).squeeze(1).long()
+
+    brightness_shift = (torch.rand(batch_size, 1, 1, 1, device=device) * 2 - 1) * max_brightness_shift
+    contrast_factor = torch.empty(batch_size, 1, 1, 1, device=device).uniform_(*contrast_range)
+    noise = torch.randn_like(images) * noise_strength
+    images = images * contrast_factor + brightness_shift + noise
+
+    return images, labels
 
 
 
