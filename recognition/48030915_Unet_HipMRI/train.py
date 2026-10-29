@@ -80,16 +80,78 @@ def make_grad_scaler(enabled):
     except (AttributeError, TypeError):
         return torch.cuda.amp.GradScaler(enabled=enabled)
 
-# train_one_epoch(model, loader, loss_fn, optimiser, scaler, device, augment_fn) -> mean loss
-#   - for each batch: to GPU -> augment -> forward -> loss -> backward -> optimiser step
-#   - mixed precision (torch.autocast + GradScaler): faster, about half the memory
+def train_one_epoch(model, loader, loss_fn, optimiser, scaler, device, augment_fn=None):
+    """One pass over the training data. Returns the mean training loss."""
+    model.train()
+    total_loss, n_samples = 0.0, 0
+    for images, labels in loader:
+        images = images.to(device, non_blocking=True)
+        labels = labels.to(device, non_blocking=True)
+        if augment_fn is not None:
+            images, labels = augment_fn(images, labels)
 
-# validate(model, loader, loss_fn) -> val loss, per-class Dice
-#   - model.eval(), torch.no_grad(), argmax -> SegMetrics
+        optimiser.zero_grad(set_to_none=True)
+        # mixed precision: most maths in float16 on the GPU -> faster and about half the memory
+        with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=scaler.is_enabled()):
+            loss = loss_fn(model(images), labels)
+        scaler.scale(loss).backward()      # scaling stops tiny float16 gradients becoming 0
+        scaler.step(optimiser)
+        scaler.update()
 
-# plot_curves(history, path)
-#   - left: train vs validation loss; right: validation Dice per class (prostate in bold,
-#     dashed line at the target). Save every epoch so you can look while it trains.
+        total_loss += loss.item() * len(images)
+        n_samples += len(images)
+    return total_loss / n_samples
+
+
+@torch.no_grad()
+def evaluate(model, loader, loss_fn, device, use_amp):
+    """Loss and pooled per-class metrics on a validation or test loader. No augmentation, no gradients."""
+    model.eval()
+    metrics = SegMetrics(N_CLASSES)
+    total_loss, n_samples = 0.0, 0
+    for images, labels in loader:
+        images, labels = images.to(device), labels.to(device)
+        with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=use_amp):
+            logits = model(images)
+        total_loss += loss_fn(logits.float(), labels).item() * len(images)
+        n_samples += len(images)
+        metrics.update(logits.argmax(dim=1), labels)
+    return total_loss / n_samples, metrics
+
+
+def plot_curves(history, path, target):
+    """Left: train vs validation loss. Right: validation Dice per class (prostate in bold)."""
+    import matplotlib
+    matplotlib.use("Agg")                       # no screen on Rangpur: draw straight to a file
+    import matplotlib.pyplot as plt
+
+    epochs = [row["epoch"] for row in history]
+    fig, (ax_loss, ax_dice) = plt.subplots(1, 2, figsize=(11, 4))
+    ax_loss.plot(epochs, [row["train_loss"] for row in history], label="train")
+    ax_loss.plot(epochs, [row["val_loss"] for row in history], label="validation")
+    ax_loss.set_xlabel("epoch")
+    ax_loss.set_ylabel("Dice + CE loss")
+    ax_loss.set_title("Loss")
+    ax_loss.legend()
+    for c in range(1, N_CLASSES):
+        ax_dice.plot(epochs, [row[f"dice_{CLASS_NAMES[c]}"] for row in history], label=CLASS_NAMES[c],
+                     lw=2.5 if c == PROSTATE else 1.2)
+    ax_dice.axhline(target, color="grey", ls="--", lw=1, label=f"target {target}")
+    ax_dice.set_ylim(0, 1)
+    ax_dice.set_xlabel("epoch")
+    ax_dice.set_ylabel("validation Dice")
+    ax_dice.set_title("Validation Dice per class")
+    ax_dice.legend(fontsize=8)
+    fig.tight_layout()
+    fig.savefig(path, dpi=130)
+    plt.close(fig)
+
+
+def write_history(history, path):
+    with open(path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=list(history[0]))
+        writer.writeheader()
+        writer.writerows(history)
 
 # main()
 #   1. data: build datasets with the dataset.py functions; check_no_leakage; print summaries
