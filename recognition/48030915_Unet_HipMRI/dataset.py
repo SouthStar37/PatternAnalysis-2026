@@ -1,20 +1,60 @@
-# dataset.py
+"""
+dataset.py - Data loading, preprocessing, leakage-free splitting and augmentation for HipMRI.
 
-# Labels: 0 background, 1 body, 2 bone, 3 bladder, 4 rectum, 5 prostate
+Labels: 0 background, 1 body, 2 bone, 3 bladder, 4 rectum, 5 prostate.
+"""
+import math
+import re
+from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+
+import nibabel as nib
+import numpy as np
+import torch
+import torch.nn.functional as F
+from torch.utils.data import Dataset, WeightedRandomSampler
 
 # SHARED (used by both 2D and 3D)
 
-# constants
-#   - DATA_ROOT = "/home/groups/comp3710/HipMRI_Study_open"
-#   - folder names for the 2D slices and the 3D volumes
-#   - CLASS_NAMES, N_CLASSES = 6, PROSTATE = 5, BLADDER = 3, RECTUM = 4
+DATA_ROOT = "/home/groups/comp3710/HipMRI_Study_open"
+SLICE_DIR = "keras_slices_data"                                   # 2D slices
+IMAGE_DIR_3D, LABEL_DIR_3D = "semantic_MRs", "semantic_labels_only"  # 3D volumes
+SPLITS_2D = {                                                      # split -> (image folder, label folder)
+    "train": ("keras_slices_train", "keras_slices_seg_train"),
+    "validate": ("keras_slices_validate", "keras_slices_seg_validate"),
+    "test": ("keras_slices_test", "keras_slices_seg_test"),
+}
+CLASS_NAMES = ["background", "body", "bone", "bladder", "rectum", "prostate"]
+N_CLASSES = len(CLASS_NAMES)
+BLADDER, RECTUM, PROSTATE = 3, 4, 5
+SLICE_SHAPE = (256, 128)   # every 2D slice is cropped/padded to this (H, W)
 
-# load_nifti(path) -> numpy array
-#   - nibabel.load(path), np.asanyarray(img.dataobj), np.squeeze (drops extra size-1 dims)
-#   - labels: np.rint(...).astype(uint8) (stored as float in some files)
 
-# check_no_leakage({split: patient_ids}) -> raises an error if a patient is in 2+ splits
+def load_nifti(path, is_label=False):
+    """Read a NIfTI file into a numpy array.
 
+    np.squeeze removes extra size-1 dimensions some files have (e.g. 256x128x1).
+    Labels are rounded to integers because some label files are stored as floats.
+    """
+    arr = np.squeeze(np.asanyarray(nib.load(str(path)).dataobj))
+    if is_label:
+        return np.rint(arr).astype(np.uint8)
+    return arr.astype(np.float32)
+
+
+def check_no_leakage(groups):
+    """Raise an error if any patient appears in more than one split.
+
+    groups: {split name: iterable of patient/case IDs}. Returns patients per split.
+    """
+    names = list(groups)
+    for i, a in enumerate(names):
+        for b in names[i + 1:]:
+            shared = set(groups[a]) & set(groups[b])
+            if shared:
+                raise RuntimeError(f"Patient leakage: {sorted(shared)} are in both {a} and {b}")
+    return {k: len(set(v)) for k, v in groups.items()}
 
 # 2D HipMRI dataset (keras_slices_data)
 
