@@ -18,9 +18,9 @@ from torch.utils.data import Dataset, WeightedRandomSampler
 # SHARED (used by both 2D and 3D)
 
 DATA_ROOT = "/home/groups/comp3710/HipMRI_Study_open"
-SLICE_DIR = "keras_slices_data"                                   # 2D slices
-IMAGE_DIR_3D, LABEL_DIR_3D = "semantic_MRs", "semantic_labels_only"  # 3D volumes
-SPLITS_2D = {                                                      # split -> (image folder, label folder)
+SLICE_DIR = "keras_slices_data" # 2D slices
+IMAGE_DIR_3D, LABEL_DIR_3D = "semantic_MRs", "semantic_labels_only" # 3D volumes
+SPLITS_2D = { # split -> (image folder, label folder)
     "train": ("keras_slices_train", "keras_slices_seg_train"),
     "validate": ("keras_slices_validate", "keras_slices_seg_validate"),
     "test": ("keras_slices_test", "keras_slices_seg_test"),
@@ -28,7 +28,7 @@ SPLITS_2D = {                                                      # split -> (i
 CLASS_NAMES = ["background", "body", "bone", "bladder", "rectum", "prostate"]
 N_CLASSES = len(CLASS_NAMES)
 BLADDER, RECTUM, PROSTATE = 3, 4, 5
-SLICE_SHAPE = (256, 128)   # every 2D slice is cropped/padded to this (H, W)
+SLICE_SHAPE = (256, 128) # every 2D slice is cropped/padded to this (H, W)
 
 
 def load_nifti(path, is_label=False):
@@ -59,30 +59,113 @@ def check_no_leakage(groups):
 # 2D HipMRI dataset (keras_slices_data)
 
 # ---- data loader -----
-# parse_key(filename) -> (case, week, slice)
-#   - regex on "case_004_week_0_slice_12.nii.gz" / "seg_004_week_0_slice_12.nii.gz"
+_KEY_2D = re.compile(r"(\d+)_wek_?(\d+)_slice_?(\d+)", re.I) # case_004_week_0_slice_12
 
-# list_pairs(root, split) -> sorted [(key, image_path, label_path)]
-#   - pairs image and label by key; raise if any file has no partner
 
-# class HipMRISlices(torch.utils.data.Dataset)
-#   __init__(root, split, shape=(256, 128), max_scans=None)
-#       - load every slice of the split into memory once 
-#       - keep keys and a scan index: (case, week) -> list of slice indices 
-#       - has_prostate[i]: whether slice i contains prostate (for oversampling)
+def parse_key(filename):
+    """'case_004_week_0_slice_12.nii.gz' (or 'seg_...') -> (4, 0, 12)."""
+    m = _KEY_2D.search(filename)
+    if m is None:
+        raise ValueError(f"Cannot parse case/week/slice from '{filename}'")
+    return int(m.group(1)), int(m.group(2)), int(m.group(3))
 
-#   __len__()
-#   __getitem__(i) -> image tensor (1, H, W) float32, label tensor (H, W) int64
-#   summary() -> one-line description: slices, scans, cases, % slices with prostate
+
+def list_pairs(root, split):
+    """Sorted list of (key, image_path, label_path) for one provided split."""
+    if split not in SPLITS_2D:
+        raise ValueError(f"split must be one of {list(SPLITS_2D)}")
+    
+    img_dir, seg_dir = (Path(root) / SLICE_DIR / d for d in SPLITS_2D[split])
+    images = {parse_key(p.name): p for p in img_dir.glob("*.nii*")}
+    labels = {parse_key(p.name): p for p in seg_dir.glob("*.nii*")}
+
+    if set(images) != set(labels):
+        raise RuntimeError(f"{split}: {len(set(images) - set(labels))} images without labels, "
+                           f"{len(set(labels) - set(images))} labels without images")
+    
+    return [(k, images[k], labels[k]) for k in sorted(images)]
+
+
+def list_all_pairs(root):
+    """Pairs from all three provided folders (used only when re-splitting by patient)."""
+    return sorted((p for split in SPLITS_2D for p in list_pairs(root, split)), key=lambda p: p[0])
+
+class HipMRISlices(Dataset):
+    
+    def __init__(self, root=DATA_ROOT, split="train", shape=SLICE_SHAPE, max_scans=None, cases=None, workers=8):
+        self.split, self.shape = split, tuple(shape)
+        if cases is None:
+            pairs = list_pairs(root, split)
+        else:
+            keep = set(cases)
+            pairs = [p for p in list_all_pairs(root) if p[0][0] in keep]
+        if max_scans:
+            first = list(OrderedDict.fromkeys(k[:2] for k, _, _ in pairs))[:max_scans]
+            pairs = [p for p in pairs if p[0][:2] in set(first)]
+        if not pairs:
+            raise RuntimeError(f"No slices found for split '{split}' under {root}")
+
+        with ThreadPoolExecutor(max_workers=workers) as ex:      # reading 11k files in parallel
+            loaded = list(ex.map(self._load_pair, pairs))
+        self.images = np.stack([img for img, _ in loaded])       # (N, H, W) float32
+        self.labels = np.stack([lab for _, lab in loaded])       # (N, H, W) uint8
+        bad = np.setdiff1d(np.unique(self.labels), np.arange(N_CLASSES))
+        if bad.size:
+            raise ValueError(f"Unexpected label values {bad.tolist()} in split '{split}'")
+
+        self.keys = [k for k, _, _ in pairs]                     # (case, week, slice) per item
+        self.scan_index = OrderedDict()                           # (case, week) -> slice indices
+        for i, (case, week, _) in enumerate(self.keys):
+            self.scan_index.setdefault((case, week), []).append(i)
+        self.cases = sorted({case for case, _ in self.scan_index})
+        self._normalise_per_scan()
+        self.has_prostate = (self.labels == PROSTATE).reshape(len(self.labels), -1).any(axis=1)
+
+    def _load_pair(self, pair):
+        _, img_path, lab_path = pair
+        img = crop_or_pad(load_nifti(img_path), self.shape)
+        lab = crop_or_pad(load_nifti(lab_path, is_label=True), self.shape)
+        return img, lab
+
+    def _normalise_per_scan(self):
+        """z-score each scan using all its slices together (intensity ranges differ between scans)."""
+        for idx in self.scan_index.values():
+            block = self.images[idx]
+            self.images[idx] = (block - block.mean()) / max(float(block.std()), 1e-6)
+
+    def __len__(self):
+        return len(self.images)
+
+    def __getitem__(self, i):
+        img = torch.from_numpy(self.images[i]).unsqueeze(0) # add channel dim -> (1, H, W)
+        lab = torch.from_numpy(self.labels[i].astype(np.int64)) # class numbers -> (H, W)
+        return img, lab
+
+    def class_fractions(self):
+        counts = np.bincount(self.labels.ravel(), minlength=N_CLASSES)
+        return counts / counts.sum()
+
+    def summary(self):
+        return (f"{self.split}: {len(self)} slices, {len(self.scan_index)} scans, {len(self.cases)} cases, "
+                f"{self.has_prostate.mean():.1%} slices with prostate, "
+                f"prostate {self.class_fractions()[PROSTATE]:.3%} of pixels")
 
 # ---- preprocessing -----
-
-# crop_or_pad(arr, shape) -> centre-crop or pad to (256, 128)
-#   - needed because one scan's slices are 256 x 144 (fro data audit)
-
-# per-scan z-score: for each (case, week), (x - mean) / std over all 60 slices together
-#   - intensity ranges differ a lot between scans (data audit: 99th percentile 161-713)
-#   - after normalisation: mean about 0, std about 1
+def crop_or_pad(arr, shape, fill=0):
+    """Centre-crop or pad a 2D array to `shape`. Needed because one scan is 256 x 144."""
+    out = np.full(shape, fill, dtype=arr.dtype)
+    src, dst = [], []
+    for n_in, n_out in zip(arr.shape, shape):
+        if n_in >= n_out:                       # crop: take the middle n_out
+            start = (n_in - n_out) // 2
+            src.append(slice(start, start + n_out))
+            dst.append(slice(0, n_out))
+        else:                                   # pad: put the array in the middle
+            start = (n_out - n_in) // 2
+            src.append(slice(0, n_in))
+            dst.append(slice(start, start + n_in))
+    out[tuple(dst)] = arr[tuple(src)]
+    return out
 
 # ---- leakage-free splitting -----
 
