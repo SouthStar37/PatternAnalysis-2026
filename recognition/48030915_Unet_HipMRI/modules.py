@@ -200,15 +200,72 @@ class ImprovedUNet2D(nn.Module):
 
 # class ImprovedUNet3D(...)
 
-# Loss and metric (shared by 2D and 3D; write them to work for any number of dimensions)
+# Loss and metric (shared by 2D and 3D)
+class DiceCELoss(nn.Module):
+    """ce_weight * cross-entropy + dice_weight * (1 - mean soft Dice of the foreground classes).
 
-# class DiceCELoss(n_classes, dice_weight=1, ce_weight=1)
-#   - cross-entropy + (1 - mean soft Dice of the foreground classes present in the batch)
-#   - one-hot the labels here with F.one_hot(...).movedim(-1, 1)
-#   - why Dice: the prostate is ~0.1-0.4% of pixels; cross-entropy alone lets the model ignore it
+    Why Dice: the prostate is only ~0.1-0.4% of pixels, so cross-entropy alone can score well
+    while ignoring it. Dice measures overlap per class, so the prostate counts as much as the body.
+    Dice is computed over the whole batch at once, and only for classes present in the batch
+    (a class absent from every image has no meaningful Dice; cross-entropy still punishes
+    false positives for it).
+    """
 
-# class SegMetrics
-#   - update(pred_labels, true_labels): accumulate per-class confusion counts (torch.bincount)
-#   - dice(), iou(): per-class tensors pooled over the whole validation/test set
+    def __init__(self, n_classes=6, dice_weight=1.0, ce_weight=1.0, smooth=1e-5):
+        super().__init__()
+        self.n_classes, self.dice_weight, self.ce_weight, self.smooth = n_classes, dice_weight, ce_weight, smooth
 
-# build_model(name, dims) and count_parameters(model): small helpers used by train/predict
+    def forward(self, logits, target):
+        """logits: (B, C, *spatial) raw scores; target: (B, *spatial) class numbers."""
+        cross_entropy = F.cross_entropy(logits, target)
+
+        probabilities = logits.float().softmax(dim=1)
+        target_onehot = F.one_hot(target, self.n_classes).movedim(-1, 1).float()   # (B, C, *spatial)
+        sum_dims = (0,) + tuple(range(2, logits.ndim))                           # batch + all spatial dims
+        overlap = (probabilities * target_onehot).sum(sum_dims)
+        total = probabilities.sum(sum_dims) + target_onehot.sum(sum_dims)
+        dice_per_class = (2 * overlap + self.smooth) / (total + self.smooth)
+
+        present = target_onehot.sum(sum_dims)[1:] > 0                            # foreground classes in batch
+        if not present.any():
+            return self.ce_weight * cross_entropy
+        dice_loss = 1 - dice_per_class[1:][present].mean()
+        return self.ce_weight * cross_entropy + self.dice_weight * dice_loss
+
+
+class SegMetrics:
+    """Per-class Dice and IoU pooled over a whole dataset (call update() for every batch)."""
+
+    def __init__(self, n_classes=6):
+        self.n_classes = n_classes
+        self.overlap = torch.zeros(n_classes, dtype=torch.float64)
+        self.predicted = torch.zeros(n_classes, dtype=torch.float64)
+        self.actual = torch.zeros(n_classes, dtype=torch.float64)
+
+    @torch.no_grad()
+    def update(self, predicted_labels, true_labels):
+        # confusion matrix in one pass: rows = true class, columns = predicted class
+        pairs = true_labels.reshape(-1) * self.n_classes + predicted_labels.reshape(-1)
+        confusion = torch.bincount(pairs, minlength=self.n_classes ** 2).reshape(self.n_classes, self.n_classes)
+        confusion = confusion.double().cpu()
+        self.overlap += confusion.diag()
+        self.predicted += confusion.sum(0)
+        self.actual += confusion.sum(1)
+
+    def dice(self):
+        return 2 * self.overlap / (self.predicted + self.actual).clamp(min=1)
+
+    def iou(self):
+        return self.overlap / (self.predicted + self.actual - self.overlap).clamp(min=1)
+
+# helpers
+MODELS = {("improved", 2): ImprovedUNet2D}  # the 3D model is added here later
+
+def build_model(name="improved", dims=2, **kwargs):
+    if (name, dims) not in MODELS:
+        raise ValueError(f"Unknown model {name} {dims}D; available: {list(MODELS)}")
+    return MODELS[(name, dims)](**kwargs)
+
+
+def count_parameters(model):
+    return sum(p.numel() for p in model.parameters() if p.requires_grad)

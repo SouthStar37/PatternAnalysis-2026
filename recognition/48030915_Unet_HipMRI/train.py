@@ -5,16 +5,80 @@
 
 # Run: python train.py --dim 2d   |   python train.py --dim 3d
 
+import argparse
+import csv
+import json
+import random
+import time
+from pathlib import Path
+
+import numpy as np
+import torch
+from torch.utils.data import DataLoader
+
+from dataset import (CLASS_NAMES, DATA_ROOT, N_CLASSES, PROSTATE, HipMRISlices, augment_2d, check_no_leakage,
+                     prostate_sampler, split_cases)
+from modules import DiceCELoss, SegMetrics, build_model, count_parameters
+
+DIM_DEFAULTS = {
+    "2d": {"batch_size": 16, "epochs": 60, "patience": 12},
+    "3d": {"batch_size": 2, "epochs": 150, "patience": 30},
+}
+BASE_FILTERS = {"improved": 16, "unet": 32} 
+TARGET_DICE = {"2d": 0.75, "3d": 0.70} 
 
 # SHARED 
 
-# get_args()  (argparse)
-#   --dim 2d|3d, --model improved|unet, --epochs, --batch-size, --lr, --base-filters,
-#   --dropout, --dice-weight, --ce-weight, --patience, --no-augment, --out, --seed,
-#   --max-scans / --max-volumes (small subset for quick tests), --resume (3D)
-#   - defaults differ per dim: 2D batch 16 / 60 epochs; 3D batch 2 / 150 epochs
+def get_args():
+    ap = argparse.ArgumentParser(description="Train a U-Net on HipMRI")
+    ap.add_argument("--dim", default="2d", choices=["2d", "3d"])
+    ap.add_argument("--model", default="improved", choices=["improved", "unet"])
+    ap.add_argument("--data-root", default=DATA_ROOT)
+    ap.add_argument("--out", default=None, help="output folder (default runs/<model><dim>)")
+    ap.add_argument("--epochs", type=int, default=None)
+    ap.add_argument("--batch-size", type=int, default=None)
+    ap.add_argument("--lr", type=float, default=5e-4)
+    ap.add_argument("--weight-decay", type=float, default=1e-5)
+    ap.add_argument("--base-filters", type=int, default=None)
+    ap.add_argument("--dropout", type=float, default=0.3)
+    ap.add_argument("--dice-weight", type=float, default=1.0)
+    ap.add_argument("--ce-weight", type=float, default=1.0)
+    ap.add_argument("--prostate-weight", type=float, default=3.0,
+                    help="2D: slices with prostate are drawn this many times more often (1 = off)")
+    ap.add_argument("--patience", type=int, default=None, help="early stopping: epochs without improvement")
+    ap.add_argument("--no-augment", action="store_true")
+    ap.add_argument("--max-scans", type=int, default=None, help="2D: only load N scans per split (quick tests)")
+    ap.add_argument("--workers", type=int, default=4)
+    ap.add_argument("--no-amp", action="store_true", help="turn off mixed precision")
+    ap.add_argument("--resume", action="store_true", help="continue from <out>/last.pt")
+    ap.add_argument("--seed", type=int, default=42)
+    args = ap.parse_args()
 
-# set_seed(seed): random, numpy, torch: so runs are reproducible 
+    # fill in the defaults that depend on --dim / --model
+    for key, value in DIM_DEFAULTS[args.dim].items():
+        if getattr(args, key) is None:
+            setattr(args, key, value)
+    if args.base_filters is None:
+        args.base_filters = BASE_FILTERS[args.model]
+    if args.out is None:
+        args.out = f"runs/{args.model}{args.dim}"
+    return args
+
+
+def set_seed(seed):
+    """Same seed -> same initial weights, same shuffling, same augmentation: reproducible runs."""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+
+def make_grad_scaler(enabled):
+    """GradScaler for mixed precision (the API moved in newer PyTorch versions)."""
+    try:
+        return torch.amp.GradScaler("cuda", enabled=enabled)
+    except (AttributeError, TypeError):
+        return torch.cuda.amp.GradScaler(enabled=enabled)
 
 # train_one_epoch(model, loader, loss_fn, optimiser, scaler, device, augment_fn) -> mean loss
 #   - for each batch: to GPU -> augment -> forward -> loss -> backward -> optimiser step
