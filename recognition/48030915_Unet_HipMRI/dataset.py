@@ -59,7 +59,7 @@ def check_no_leakage(groups):
 # 2D HipMRI dataset (keras_slices_data)
 
 # ---- data loader -----
-_KEY_2D = re.compile(r"(\d+)_wek_?(\d+)_slice_?(\d+)", re.I) # case_004_week_0_slice_12
+_KEY_2D = re.compile(r"(\d+)_week_?(\d+)_slice_?(\d+)", re.I) # case_004_week_0_slice_12
 
 
 def parse_key(filename):
