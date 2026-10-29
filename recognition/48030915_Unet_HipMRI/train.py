@@ -1,9 +1,24 @@
+"""
+train.py - Training, validation, testing and saving.
 
-# train.py
-# Training, validation, testing and saving. Imports the model from modules.py and the data
-# from dataset.py (spec rule). Plots losses and metrics during training.
+The model comes from modules.py and the data from dataset.py (spec rule). Losses and
+per-class Dice are plotted after every epoch.
 
-# Run: python train.py --dim 2d   |   python train.py --dim 3d
+Run:
+    python train.py --dim 2d --model improved          # 2D Improved U-Net
+    python train.py --dim 2d --model unet              # plain 2D U-Net (tutorial style)
+    python train.py --dim 2d --max-scans 4 --epochs 2  # quick test on a few scans
+    python train.py --dim 2d --resume                  # continue after a Rangpur time-out
+
+Outputs in --out (default runs/<model><dim>, e.g. runs/improved2d):
+    best.pt, last.pt     checkpoints (weights + all settings; last.pt also has the optimiser state)
+    config.json          all settings
+    history.csv          per epoch: losses, validation Dice per class, learning rate, time, peak VRAM
+    curves.png           loss and validation Dice curves
+    test_metrics.json    per-class Dice / IoU of best.pt on the test split
+
+Adapted code from Lab demo 2 Unet and online resources
+"""
 
 import argparse
 import csv
@@ -94,7 +109,7 @@ def train_one_epoch(model, loader, loss_fn, optimiser, scaler, device, augment_f
         # mixed precision: most maths in float16 on the GPU -> faster and about half the memory
         with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=scaler.is_enabled()):
             loss = loss_fn(model(images), labels)
-        scaler.scale(loss).backward()      # scaling stops tiny float16 gradients becoming 0
+        scaler.scale(loss).backward()  # scaling stops tiny float16 gradients becoming 0
         scaler.step(optimiser)
         scaler.update()
 
@@ -153,23 +168,32 @@ def write_history(history, path):
         writer.writeheader()
         writer.writerows(history)
 
-# main()
-#   1. data: build datasets with the dataset.py functions; check_no_leakage; print summaries
-#   2. model, loss (DiceCELoss), optimiser (AdamW), learning-rate schedule (cosine)
-#   3. for each epoch: train_one_epoch -> validate -> scheduler step
-#        - save last.pt every epoch; save best.pt when validation PROSTATE Dice improves
-#          (store the settings inside the checkpoint, e.g. dim, model, base_filters, crop)
-#        - log a row to history.csv: losses, Dice per class, lr, epoch time, peak VRAM
-#        - plot_curves
-#        - early stopping: stop after `patience` epochs without improvement
-#   4. TEST: reload best.pt, run on the test split, print + save per-class Dice and IoU
-
 
 # 2D Improved U-Net
 
-#   - datasets: HipMRISlices("train"/"validate"/"test") from the provided folders
-#   - DataLoader with the prostate oversampling sampler; batch 16
-#   - augment_2d; target: test prostate Dice >= 0.75
+def build_data_2d(args, pin_memory):
+    """Datasets + loaders for the 2D slices, using the provided patient-level split."""
+    split = split_cases(args.data_root)
+    counts = check_no_leakage(split)                 # raises if any case is in two splits
+    print(f"Patient-level split, no leakage: {counts} cases", flush=True)
+
+    train_ds = HipMRISlices(args.data_root, "train", max_scans=args.max_scans)
+    val_ds = HipMRISlices(args.data_root, "validate", max_scans=args.max_scans)
+    print(train_ds.summary(), "\n" + val_ds.summary(), flush=True)
+
+    sampler = prostate_sampler(train_ds, args.prostate_weight, args.seed) if args.prostate_weight != 1 else None
+    train_loader = DataLoader(train_ds, args.batch_size, sampler=sampler, shuffle=sampler is None,
+                              num_workers=args.workers, pin_memory=pin_memory, drop_last=True)
+    val_loader = DataLoader(val_ds, args.batch_size * 2, shuffle=False,
+                            num_workers=args.workers, pin_memory=pin_memory)
+
+    def make_test_loader():                          # loaded only at the end, after training
+        test_ds = HipMRISlices(args.data_root, "test", max_scans=args.max_scans)
+        return test_ds, DataLoader(test_ds, args.batch_size * 2, shuffle=False, num_workers=args.workers)
+
+    augment_fn = None if args.no_augment else augment_2d
+    data_info = {"split_cases": split, "image_shape": list(train_ds.shape)}
+    return train_loader, val_loader, make_test_loader, augment_fn, data_info
 
 
 # 3D Improved U-Net
@@ -183,3 +207,103 @@ def write_history(history, path):
 
 
 
+def main():
+    args = get_args()
+    set_seed(args.seed)
+    out = Path(args.out)
+    out.mkdir(parents=True, exist_ok=True)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    use_amp = device.type == "cuda" and not args.no_amp
+    print(f"Device: {device}" + (f" ({torch.cuda.get_device_name(0)})" if device.type == "cuda" else ""), flush=True)
+
+    # 1. data
+    start_time = time.time()
+    build_data = build_data_2d if args.dim == "2d" else build_data_3d
+    train_loader, val_loader, make_test_loader, augment_fn, data_info = build_data(args, device.type == "cuda")
+    print(f"Data ready in {time.time() - start_time:.0f}s", flush=True)
+
+    # 2. model, loss, optimiser, learning-rate schedule
+    dims = 2 if args.dim == "2d" else 3
+    model = build_model(args.model, dims, n_classes=N_CLASSES, base_filters=args.base_filters,
+                        dropout=args.dropout).to(device)
+    n_params = count_parameters(model)
+    print(f"Model: {args.model} {args.dim}, {n_params:,} parameters", flush=True)
+    loss_fn = DiceCELoss(N_CLASSES, dice_weight=args.dice_weight, ce_weight=args.ce_weight)
+    optimiser = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimiser, T_max=args.epochs, eta_min=args.lr * 0.01)
+    scaler = make_grad_scaler(use_amp)
+
+    # everything predict.py needs to rebuild the model and data is stored with the weights
+    config = {**vars(args), "dims": dims, "n_classes": N_CLASSES, "n_params": n_params, **data_info}
+    (out / "config.json").write_text(json.dumps(config, indent=2))
+
+    history, best_dice, best_epoch, first_epoch = [], -1.0, 0, 1
+    if args.resume and (out / "last.pt").exists():
+        state = torch.load(out / "last.pt", map_location=device, weights_only=False)
+        model.load_state_dict(state["model"])
+        optimiser.load_state_dict(state["optimiser"])
+        scheduler.load_state_dict(state["scheduler"])
+        scaler.load_state_dict(state["scaler"])
+        history, best_dice, best_epoch = state["history"], state["best_dice"], state["best_epoch"]
+        first_epoch = state["epoch"] + 1
+        print(f"Resumed after epoch {state['epoch']} (best prostate Dice {best_dice:.4f} at epoch {best_epoch})",
+              flush=True)
+    if device.type == "cuda":
+        torch.cuda.reset_peak_memory_stats()
+
+    # 3. training loop
+    for epoch in range(first_epoch, args.epochs + 1):
+        epoch_start = time.time()
+        train_loss = train_one_epoch(model, train_loader, loss_fn, optimiser, scaler, device, augment_fn)
+        val_loss, val_metrics = evaluate(model, val_loader, loss_fn, device, use_amp)
+        scheduler.step()
+        dice = val_metrics.dice().tolist()
+
+        row = {"epoch": epoch, "train_loss": train_loss, "val_loss": val_loss,
+               **{f"dice_{CLASS_NAMES[c]}": dice[c] for c in range(N_CLASSES)},
+               "mean_foreground_dice": sum(dice[1:]) / (N_CLASSES - 1),
+               "lr": optimiser.param_groups[0]["lr"],
+               "epoch_time_s": time.time() - epoch_start,
+               "peak_vram_mb": torch.cuda.max_memory_allocated() / 2**20 if device.type == "cuda" else 0.0}
+        history.append(row)
+
+        improved = dice[PROSTATE] > best_dice
+        checkpoint = {"model": model.state_dict(), "config": config, "epoch": epoch, "val_dice": dice}
+        if improved:
+            best_dice, best_epoch = dice[PROSTATE], epoch
+            torch.save(checkpoint, out / "best.pt")
+        torch.save({**checkpoint, "optimiser": optimiser.state_dict(), "scheduler": scheduler.state_dict(),
+                    "scaler": scaler.state_dict(), "history": history, "best_dice": best_dice,
+                    "best_epoch": best_epoch}, out / "last.pt")
+        write_history(history, out / "history.csv")
+        plot_curves(history, out / "curves.png", TARGET_DICE[args.dim])
+
+        print(f"epoch {epoch:3d} | train {train_loss:.4f} | val {val_loss:.4f} | prostate Dice "
+              f"{dice[PROSTATE]:.4f}{' *' if improved else '  '} | mean fg Dice {row['mean_foreground_dice']:.4f} | "
+              f"{row['epoch_time_s']:.0f}s | {row['peak_vram_mb']:.0f} MB", flush=True)
+
+        if epoch - best_epoch >= args.patience:
+            print(f"Early stopping: no improvement for {args.patience} epochs", flush=True)
+            break
+    print(f"Best validation prostate Dice {best_dice:.4f} at epoch {best_epoch}. "
+          f"Total time {(time.time() - start_time) / 60:.1f} min", flush=True)
+
+    # 4. test the best checkpoint
+    test_ds, test_loader = make_test_loader()
+    model.load_state_dict(torch.load(out / "best.pt", map_location=device, weights_only=False)["model"])
+    _, test_metrics = evaluate(model, test_loader, loss_fn, device, use_amp)
+    dice, iou = test_metrics.dice().tolist(), test_metrics.iou().tolist()
+    result = {"best_epoch": best_epoch, "test_set": test_ds.summary(),
+              "dice": dict(zip(CLASS_NAMES, dice)), "iou": dict(zip(CLASS_NAMES, iou))}
+    (out / "test_metrics.json").write_text(json.dumps(result, indent=2))
+
+    print(f"\nTEST ({test_ds.summary()})")
+    for c, name in enumerate(CLASS_NAMES):
+        print(f"  {name:10s} Dice {dice[c]:.4f}   IoU {iou[c]:.4f}")
+    target = TARGET_DICE[args.dim]
+    print(f"Prostate Dice {dice[PROSTATE]:.4f}: {'meets' if dice[PROSTATE] >= target else 'below'} "
+          f"the {target} target. Saved to {out}", flush=True)
+
+
+if __name__ == "__main__":
+    main()
