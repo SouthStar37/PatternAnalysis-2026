@@ -345,7 +345,34 @@ def split_volumes(pairs, root=DATA_ROOT, mode="match2d", seed=42):
     return by_split, groups, warnings
 
 # ---- data augmentation -----
-# augment_3d(x, y)
-#   - left-right flip (valid here: axis 0 is left-right, pelvis nearly symmetric)
-#   - rotation about the head-feet axis (axis 2) only, + scaling
-#   - brightness / contrast / noise
+def augment_3d(images, labels, flip_probability=0.5, max_rotation_degrees=10.0, scale_range=(0.9, 1.1),
+               spatial_probability=0.5, max_brightness_shift=0.1, contrast_range=(0.9, 1.1), noise_strength=0.03):
+    
+    batch_size, device = images.shape[0], images.device
+
+    # left-right flip
+    flip = torch.rand(batch_size, device=device) < flip_probability
+    images = torch.where(flip.view(-1, 1, 1, 1, 1), images.flip(2), images)
+    labels = torch.where(flip.view(-1, 1, 1, 1), labels.flip(1), labels)
+
+    # rotation about Z + scaling
+    apply_spatial = torch.rand(batch_size, device=device) < spatial_probability
+    angle = (torch.rand(batch_size, device=device) * 2 - 1) * math.radians(max_rotation_degrees) * apply_spatial
+    random_scale = torch.empty(batch_size, device=device).uniform_(*scale_range)
+    scale = torch.where(apply_spatial, random_scale, torch.ones(batch_size, device=device))
+    cos_term, sin_term = torch.cos(angle) / scale, torch.sin(angle) / scale
+    transform = torch.zeros(batch_size, 3, 4, device=device)
+    transform[:, 0, 0] = 1 / scale
+    transform[:, 1, 1], transform[:, 1, 2] = cos_term, -sin_term
+    transform[:, 2, 1], transform[:, 2, 2] = sin_term, cos_term
+    grid = F.affine_grid(transform, images.shape, align_corners=False)
+    images = F.grid_sample(images, grid, mode="bilinear", padding_mode="border", align_corners=False)
+    labels = F.grid_sample(labels.unsqueeze(1).float(), grid, mode="nearest", padding_mode="border",
+                           align_corners=False).squeeze(1).long()
+
+    # intensity
+    brightness_shift = (torch.rand(batch_size, 1, 1, 1, 1, device=device) * 2 - 1) * max_brightness_shift
+    contrast_factor = torch.empty(batch_size, 1, 1, 1, 1, device=device).uniform_(*contrast_range)
+    noise = torch.randn_like(images) * noise_strength
+    
+    return images * contrast_factor + brightness_shift + noise, labels
