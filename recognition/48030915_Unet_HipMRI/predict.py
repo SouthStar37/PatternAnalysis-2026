@@ -21,7 +21,7 @@ import nibabel as nib
 import numpy as np
 import torch
 
-from dataset import CLASS_NAMES, IMAGE_DIR_3D, PROSTATE, HipMRISlices
+from dataset import CLASS_NAMES, IMAGE_DIR_3D, PROSTATE, HipMRISlices, HipMRIVolumes, list_volume_pairs, load_volume
 from modules import SegMetrics, build_model, count_parameters
 from utils import BAND_NAMES, band_boxplot, band_masks, evaluate_scan, failure_figure, profile_plot, save_json, \
     summarise, write_csv
@@ -166,6 +166,66 @@ def figure_cases_2d(ds, preds, picked, band_fraction, show="errors"):
                       "band_lines": band_lines(ds.labels[idx], band_fraction)})
     return cases
 
+# 3D model
+@torch.no_grad()
+def evaluate_3d(model, cfg, args, device):
+    root = args.data_root or cfg["data_root"]
+    wanted = set(cfg["split_scans"][args.split])
+    pairs = [p for p in list_volume_pairs(root) if p["id"] in wanted]
+    if args.max_scans:
+        pairs = pairs[:args.max_scans]
+    cache = None if args.max_scans else cfg.get("cache_dir")
+    ds = HipMRIVolumes(pairs, cfg["crop_centre"], crop=tuple(cfg["crop_size"]), shift=cfg["crop_shift"],
+                       cache_dir=cache)
+    print(f"Loaded {args.split}: {ds.summary()}", flush=True)
+
+    gpu = device.type == "cuda"
+    if gpu:
+        model(ds[0][0].unsqueeze(0).to(device))
+        torch.cuda.synchronize()
+        torch.cuda.reset_peak_memory_stats()
+    images, labels, preds, rows, profiles, seconds = [], [], [], [], [], 0.0
+    for i, pair in enumerate(pairs):
+        image, label = ds[i]
+        start = time.perf_counter()
+        with torch.autocast(device.type, dtype=torch.float16, enabled=gpu):
+            pred = model(image.unsqueeze(0).to(device)).argmax(1)[0]
+        if gpu:
+            torch.cuda.synchronize()
+        seconds += time.perf_counter() - start
+        pred, label = pred.cpu().numpy().astype(np.uint8), label.numpy().astype(np.uint8)
+
+        spacing = ds.meta[i]["spacing"]
+        row, profile = evaluate_scan(pred, label, spacing, args.band_fraction)
+        full_label, _ = load_volume(pair["label"], is_label=True)
+        outside = int((full_label == PROSTATE).sum() - (label == PROSTATE).sum())
+        rows.append({"case": pair["patient_num"], "week": pair["week"], "scan": pair["id"],
+                     "spacing_mm": "x".join(f"{s:.3f}" for s in spacing), "prostate_voxels_outside_crop": outside,
+                     **row})
+        profiles += [profile] if profile else []
+        images.append(image[0].numpy())
+        labels.append(label)
+        preds.append(pred)
+    timing = {"inference_ms_per_slice": None, "inference_s_per_scan": seconds / len(rows),
+              "peak_inference_vram_mb": torch.cuda.max_memory_allocated() / 2**20 if gpu else 0.0}
+    return images, labels, preds, rows, profiles, timing
+
+
+def figure_cases_3d(images, labels, preds, rows, picked, band_fraction, show="errors"):
+    cases = []
+    for r in picked:
+        k = rows.index(r)
+        image, true, pred = images[k], labels[k], preds[k]
+        if show == "errors":
+            scores = ((pred == PROSTATE) != (true == PROSTATE)).sum(axis=(0, 2))
+        else:
+            scores = (true == PROSTATE).sum(axis=(0, 2))
+        y = int(np.argmax(scores))
+        cases.append({"title": f"{r['scan']} coronal slice {y}", "image": image[:, y, :].T,
+                      "true": true[:, y, :].T, "pred": pred[:, y, :].T, "dice": r["dice_prostate"],
+                      "band_lines": band_lines(true, band_fraction)})
+    return cases
+
 # main
 def main():
     args = get_args()
@@ -212,11 +272,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-# 3D Model specifics
-#   - default: run on the central 128^3 crop the model was trained on
-#   - --full-volume: Gaussian-weighted sliding window over the whole 256x256x128 scan
-#       (needed for a fair comparison: the 2D model sees whole slices)
-#   - --keep-largest: keep only the largest connected prostate region (removes stray blobs)
-#   - timing per volume, peak inference VRAM
-
