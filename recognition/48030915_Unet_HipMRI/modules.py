@@ -211,19 +211,58 @@ class ImprovedUNet2D(nn.Module):
                 segmentation = self.upscale(segmentation) + self.segment_final(x)
         return segmentation
 
+class ImprovedUNet3D(nn.Module):
+    """Improved U-Net (Isensee et al. 2018) on 3D volumes.
+    """
+
+    def __init__(self, in_channels=1, n_classes=6, base_filters=16, depth=5, dropout=0.3):
+        super().__init__()
+        if depth < 4:
+            raise ValueError("depth must be at least 4 (deep supervision uses decoder levels 2 and 1)")
+        self.depth = depth
+        channels = [base_filters * 2 ** level for level in range(depth)]
+
+        self.input_conv = nn.Conv3d(in_channels, channels[0], 3, padding=1, bias=False)
+        self.downsample = nn.ModuleList([
+            nn.Conv3d(channels[level - 1], channels[level], 3, stride=2, padding=1, bias=False)
+            for level in range(1, depth)
+        ])
+        self.context = nn.ModuleList([ContextModule(c, dropout, dims=3) for c in channels])
+        self.bottleneck_norm = nn.Sequential(nn.InstanceNorm3d(channels[-1], affine=True),
+                                             nn.LeakyReLU(0.01, inplace=True))
+
+        decoder_levels = list(reversed(range(depth - 1)))
+        self.upsample = nn.ModuleList([UpsamplingModule(channels[level + 1], channels[level], dims=3)
+                                       for level in decoder_levels])
+        self.localise = nn.ModuleList([LocalisationModule(2 * channels[level], channels[level], dims=3)
+                                       for level in decoder_levels[:-1]])
+        self.final_conv = ConvNormAct(2 * channels[0], 2 * channels[0], dims=3)
+
+        self.segment_level2 = nn.Conv3d(channels[2], n_classes, 1)
+        self.segment_level1 = nn.Conv3d(channels[1], n_classes, 1)
+        self.segment_final = nn.Conv3d(2 * channels[0], n_classes, 1)
+        self.upscale = nn.Upsample(scale_factor=2, mode="trilinear", align_corners=False)
+
+    def forward(self, x):
+        skips = [self.context[0](self.input_conv(x))]
+        for level in range(1, self.depth):
+            skips.append(self.context[level](self.downsample[level - 1](skips[-1])))
+        x = self.bottleneck_norm(skips[-1])
+
+        segmentation = None
+        for step, level in enumerate(reversed(range(self.depth - 1))):
+            x = torch.cat([self.upsample[step](x), skips[level]], dim=1)
+            x = self.localise[step](x) if level > 0 else self.final_conv(x)
+
+            if level == 2:
+                segmentation = self.segment_level2(x)
+            elif level == 1:
+                segmentation = self.upscale(segmentation) + self.segment_level1(x)
+            elif level == 0:
+                segmentation = self.upscale(segmentation) + self.segment_final(x)
+        return segmentation
+
     
-
-
-
-
-# 3D Improved U-Net
-# -	Use downsampled HipMRI 3D data. Ref: [2]. Volumetric residual units and deep supervision; target Dice ≥ 0.7 on test set.
-
-# Same blocks with 3D layers: Conv3d, InstanceNorm3d, Dropout3d, trilinear upsampling.
-
-# class ImprovedUNet3D(...)
-
-# Loss and metric (shared by 2D and 3D)
 class DiceCELoss(nn.Module):
     """ce_weight * cross-entropy + dice_weight * (1 - mean soft Dice of the foreground classes).
 
@@ -282,7 +321,7 @@ class SegMetrics:
         return self.overlap / (self.predicted + self.actual - self.overlap).clamp(min=1)
 
 # helpers
-MODELS = {("improved", 2): ImprovedUNet2D}  # the 3D model is added here later
+MODELS = {("improved", 2): ImprovedUNet2D, ("improved", 3): ImprovedUNet3D}
 
 def build_model(name="improved", dims=2, **kwargs):
     if (name, dims) not in MODELS:
