@@ -29,21 +29,23 @@ METRICS = ["dice_prostate", "iou_prostate", "dice_apex", "dice_middle", "dice_ba
            "leak_rectum_ml", "leak_bladder_ml", "dice_bladder", "dice_rectum"]
 PATIENT_METRICS = ["dice_prostate", "hd95_mm", "dice_apex", "dice_middle", "dice_base"]
 
+SETTINGS = {
+    "data_root": None,      # None = the data folder saved in the checkpoint
+    "n_failures": 4,        # how many worst scans failure_cases.png shows
+    "band_fraction": 0.2,   # apex and base bands: 20% of the prostate's head-feet length each
+    "batch_size": 32,       # 2D slices per forward pass
+}
 
 def get_args():
     ap = argparse.ArgumentParser(description="Evaluate a trained HipMRI model")
     ap.add_argument("--checkpoint", help="path to best.pt")
     ap.add_argument("--split", default="test", choices=["train", "validate", "test"])
-    ap.add_argument("--data-root", help="default: the one used for training")
-    ap.add_argument("--out")
-    ap.add_argument("--n-failures", type=int, default=4, help="how many worst scans to plot")
-    ap.add_argument("--band-fraction", type=float, default=0.2, help="size of the apex and base bands")
-    ap.add_argument("--batch-size", type=int, default=32)
     ap.add_argument("--max-scans", type=int, help="quick test on a few scans")
     ap.add_argument("--compare", nargs=2, metavar=("RESULTS_A", "RESULTS_B"), help="compare two results.json")
     args = ap.parse_args()
     if not (args.compare or args.checkpoint):
         ap.error("--checkpoint is required (or use --compare)")
+    vars(args).update(SETTINGS)
     return args
 
 
@@ -233,7 +235,7 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model, cfg, epoch = load_model(args.checkpoint, device)
     dims = cfg["dims"]
-    out = Path(args.out or Path(args.checkpoint).parent / f"eval_{args.split}")
+    out = Path(args.checkpoint).parent / f"eval_{args.split}"
     out.mkdir(parents=True, exist_ok=True)
     print(f"Model {cfg['model']} {dims}D from epoch {epoch} ({count_parameters(model):,} parameters)", flush=True)
     if dims == 2:
