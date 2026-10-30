@@ -9,6 +9,8 @@ Run:
     python train.py --dim 2d --model unet              # plain 2D U-Net (tutorial style)
     python train.py --dim 2d --max-scans 4 --epochs 2  # quick test on a few scans
     python train.py --dim 2d --resume                  # continue after a Rangpur time-out
+    python train.py --dim 3d                           # 3D Improved U-Net
+    python train.py --dim 3d --max-scans 4 --epochs 2  # quick 3D test on a few volumes
 
 Outputs in --out (default runs/<model><dim>, e.g. runs/improved2d):
     best.pt, last.pt     checkpoints (weights + all settings; last.pt also has the optimiser state)
@@ -31,8 +33,9 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader
 
-from dataset import (CLASS_NAMES, DATA_ROOT, N_CLASSES, PROSTATE, HipMRISlices, augment_2d, check_no_leakage,
-                     prostate_sampler, split_cases)
+from dataset import (CLASS_NAMES, CROP_3D, DATA_ROOT, N_CLASSES, PROSTATE, SHIFT_3D, HipMRISlices, HipMRIVolumes,
+                     augment_2d, augment_3d, check_no_leakage, crop_centre_from_labels, list_volume_pairs,
+                     prostate_sampler, split_cases, split_volumes)
 from modules import DiceCELoss, SegMetrics, build_model, count_parameters
 
 DIM_DEFAULTS = {
@@ -62,7 +65,10 @@ def get_args():
                     help="2D: slices with prostate are drawn this many times more often (1 = off)")
     ap.add_argument("--patience", type=int, default=None, help="early stopping: epochs without improvement")
     ap.add_argument("--no-augment", action="store_true")
-    ap.add_argument("--max-scans", type=int, default=None, help="2D: only load N scans per split (quick tests)")
+    ap.add_argument("--max-scans", type=int, default=None,
+                    help="quick tests: only load N scans (2D) or N volumes (3D) per split")
+    ap.add_argument("--cache-dir", default=None,
+                    help="3D: save the cropped volumes here so later runs load in seconds (uses a few GB)")
     ap.add_argument("--workers", type=int, default=4)
     ap.add_argument("--no-amp", action="store_true", help="turn off mixed precision")
     ap.add_argument("--resume", action="store_true", help="continue from <out>/last.pt")
@@ -197,14 +203,41 @@ def build_data_2d(args, pin_memory):
 
 
 # 3D Improved U-Net
+def build_data_3d(args, pin_memory):
 
-#   - split_volumes(match2d) -> crop centre from TRAINING labels -> HipMRIVolumes
-#     (train=True for random shifted crops; train=False for validation/test)
-#   - batch 2 (memory); validation batch 1
-#   - augment_3d; target: test prostate Dice >= 0.70
-#   - --resume from last.pt (save optimiser/scheduler/history in it) for Rangpur time limits
-#   - store crop centre, crop size and the split's volume IDs in the checkpoint for predict.py
+    pairs = list_volume_pairs(args.data_root)
+    by_split, groups, warnings = split_volumes(pairs, args.data_root)
+    counts = check_no_leakage(groups) 
+    print(f"Patient-level split matched to 2D, no leakage: {counts} patients, "
+          f"{ {split: len(scans) for split, scans in by_split.items()} } volumes", flush=True)
+    for warning in warnings:
+        print("  note:", warning, flush=True)
+    if args.max_scans:
+        by_split = {split: scans[:args.max_scans] for split, scans in by_split.items()}
 
+    centre, box = crop_centre_from_labels(by_split["train"], workers=args.workers)
+    print(f"Crop centre {centre} (prostate of every training volume lies in {box})", flush=True)
+
+    def volumes(split, train):
+        return HipMRIVolumes(by_split[split], centre, train=train, cache_dir=args.cache_dir)
+
+    train_ds, val_ds = volumes("train", True), volumes("validate", False)
+    print(f"train: {train_ds.summary()}\nvalidate: {val_ds.summary()}", flush=True)
+    train_loader = DataLoader(train_ds, args.batch_size, shuffle=True, num_workers=args.workers,
+                              pin_memory=pin_memory, drop_last=len(train_ds) > args.batch_size)
+    val_loader = DataLoader(val_ds, args.batch_size, shuffle=False, num_workers=args.workers, pin_memory=pin_memory)
+
+    def make_test_loader(): 
+        test_ds = volumes("test", False)
+        return test_ds, DataLoader(test_ds, args.batch_size, shuffle=False, num_workers=args.workers)
+
+    augment_fn = None if args.no_augment else augment_3d
+
+    data_info = {"split_patients": groups, "split_scans": {split: [p["id"] for p in scans]
+                                                           for split, scans in by_split.items()},
+                 "split_warnings": warnings, "crop_centre": centre, "crop_size": list(CROP_3D),
+                 "crop_shift": SHIFT_3D, "prostate_box": box, "image_shape": list(CROP_3D)}
+    return train_loader, val_loader, make_test_loader, augment_fn, data_info
 
 
 def main():
@@ -216,13 +249,13 @@ def main():
     use_amp = device.type == "cuda" and not args.no_amp
     print(f"Device: {device}" + (f" ({torch.cuda.get_device_name(0)})" if device.type == "cuda" else ""), flush=True)
 
-    # 1. data
+    # data
     start_time = time.time()
     build_data = build_data_2d if args.dim == "2d" else build_data_3d
     train_loader, val_loader, make_test_loader, augment_fn, data_info = build_data(args, device.type == "cuda")
     print(f"Data ready in {time.time() - start_time:.0f}s", flush=True)
 
-    # 2. model, loss, optimiser, learning-rate schedule
+    # model, loss, optimiser, learning-rate schedule
     dims = 2 if args.dim == "2d" else 3
     model = build_model(args.model, dims, n_classes=N_CLASSES, base_filters=args.base_filters,
                         dropout=args.dropout).to(device)
@@ -233,7 +266,6 @@ def main():
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimiser, T_max=args.epochs, eta_min=args.lr * 0.01)
     scaler = make_grad_scaler(use_amp)
 
-    # everything predict.py needs to rebuild the model and data is stored with the weights
     config = {**vars(args), "dims": dims, "n_classes": N_CLASSES, "n_params": n_params, **data_info}
     (out / "config.json").write_text(json.dumps(config, indent=2))
 
@@ -251,7 +283,7 @@ def main():
     if device.type == "cuda":
         torch.cuda.reset_peak_memory_stats()
 
-    # 3. training loop
+    # training loop
     for epoch in range(first_epoch, args.epochs + 1):
         epoch_start = time.time()
         train_loss = train_one_epoch(model, train_loader, loss_fn, optimiser, scaler, device, augment_fn)
@@ -288,7 +320,7 @@ def main():
     print(f"Best validation prostate Dice {best_dice:.4f} at epoch {best_epoch}. "
           f"Total time {(time.time() - start_time) / 60:.1f} min", flush=True)
 
-    # 4. test the best checkpoint
+    # test the best checkpoint
     test_ds, test_loader = make_test_loader()
     model.load_state_dict(torch.load(out / "best.pt", map_location=device, weights_only=False)["model"])
     _, test_metrics = evaluate(model, test_loader, loss_fn, device, use_amp)
