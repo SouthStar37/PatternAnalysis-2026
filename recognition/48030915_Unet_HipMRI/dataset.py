@@ -292,14 +292,43 @@ def load_volume(path, is_label=False):
 
 # ---- preprocessing -----
 
-# crop_centre_from_labels(train_pairs) -> centre of the union prostate box over TRAINING labels only
-#   - never use test labels for anything except scoring
+def crop_centre_from_labels(train_pairs, workers=4):
+    def prostate_box(pair):
+        labels, _ = load_volume(pair["label"], is_label=True)
+        voxels = np.nonzero(labels == PROSTATE)
+        return [(int(v.min()), int(v.max())) for v in voxels] if voxels[0].size else None
 
-# extract_window(arr, start, size) -> crop with padding where it leaves the volume
-#   - handles the one 256 x 256 x 144 volume
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        boxes = [box for box in ex.map(prostate_box, train_pairs) if box]
+    if not boxes:
+        raise RuntimeError("No prostate found in the training labels")
+    low = [min(box[axis][0] for box in boxes) for axis in range(3)]
+    high = [max(box[axis][1] for box in boxes) for axis in range(3)]
+    centre = [int(round((lo + hi) / 2)) for lo, hi in zip(low, high)]
+    return centre, {"min": low, "max": high}
 
-# per-volume z-score using the statistics of the central crop
-#   - store mean/std
+def crop_windows(volume_shape, centre, crop=CROP_3D, shift=SHIFT_3D, window_size=None):
+    eval_start = [int(min(max(c - n // 2, 0), max(length - n, 0)))
+                  for c, n, length in zip(centre, crop, volume_shape)]
+    if window_size is None:
+        window_size = [min(n + 2 * shift, max(length, n)) for n, length in zip(crop, volume_shape)]
+    window_start = []
+    for e, w, n, length in zip(eval_start, window_size, crop, volume_shape):
+        s = e - (w - n) // 2  
+        s = min(max(s, 0), max(length - w, 0)) 
+        s = min(max(s, e + n - w), e) 
+        window_start.append(int(s))
+    return eval_start, window_start, list(window_size)
+
+def extract_window(volume, start, size, fill=0):
+    out = np.full(size, fill, dtype=volume.dtype)
+    source, target = [], []
+    for s, n, length in zip(start, size, volume.shape):
+        a, b = max(s, 0), min(s + n, length)
+        source.append(slice(a, b))
+        target.append(slice(a - s, b - s))
+    out[tuple(target)] = volume[tuple(source)]
+    return out
 
 # ---- leakage-free splitting -----
 
@@ -374,5 +403,5 @@ def augment_3d(images, labels, flip_probability=0.5, max_rotation_degrees=10.0, 
     brightness_shift = (torch.rand(batch_size, 1, 1, 1, 1, device=device) * 2 - 1) * max_brightness_shift
     contrast_factor = torch.empty(batch_size, 1, 1, 1, 1, device=device).uniform_(*contrast_range)
     noise = torch.randn_like(images) * noise_strength
-    
+
     return images * contrast_factor + brightness_shift + noise, labels
