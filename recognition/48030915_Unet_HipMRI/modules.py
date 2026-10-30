@@ -86,32 +86,53 @@ class UNet2D(nn.Module):
         return self.output_conv(u) 
 
 
-# 2D Improved U-Net 
-# -	Use HipMRI 2D slices. Ref: [2]. Target Dice ≥ 0.75 on prostate label on test set
+# Improved U-Net (2D and 3D)
+
+# The 2D and 3D networks are identical in structure, except for the dimension.
+# -	2D: HipMRI 2D slices. Ref: [2]. Target Dice >= 0.75 on prostate label on test set
+# -	3D: downsampled HipMRI 3D data. Ref: [2]. Volumetric residual units and deep supervision;
+#       target Dice >= 0.7 on test set
+
+# ---- layer types per dimension -----
+LAYERS = {
+    2: {"conv": nn.Conv2d, "norm": nn.InstanceNorm2d, "dropout": nn.Dropout2d, "linear_mode": "bilinear"},
+    3: {"conv": nn.Conv3d, "norm": nn.InstanceNorm3d, "dropout": nn.Dropout3d, "linear_mode": "trilinear"},
+}
+
+def layers_for(dims):
+    """The layer types for a 2D or 3D network."""
+    if dims not in LAYERS:
+        raise ValueError(f"dims must be 2 or 3, not {dims}")
+    return LAYERS[dims]
 
 # ---- building blocks  -----
 
 class ConvNormAct(nn.Sequential):
+    """conv -> instance norm -> leaky ReLU."""
 
-    def __init__(self, in_channels, out_channels, kernel_size=3, stride=1):
+    def __init__(self, in_channels, out_channels, kernel_size=3, stride=1, dims=2):
+        L = layers_for(dims)
         super().__init__(
-            nn.Conv2d(in_channels, out_channels, kernel_size, stride=stride, padding=kernel_size // 2, bias=False),
-            nn.InstanceNorm2d(out_channels, affine=True),
+            L["conv"](in_channels, out_channels, kernel_size, stride=stride, padding=kernel_size // 2, bias=False),
+            L["norm"](out_channels, affine=True),
             nn.LeakyReLU(0.01, inplace=True),
         )
 
 
 class ContextModule(nn.Module):
-    def __init__(self, channels, dropout=0.3):
+    """Residual pre-activation block: x + (norm -> act -> conv -> dropout -> norm -> act -> conv)(x)."""
+
+    def __init__(self, channels, dropout=0.3, dims=2):
         super().__init__()
+        L = layers_for(dims)
         self.block = nn.Sequential(
-            nn.InstanceNorm2d(channels, affine=True),
+            L["norm"](channels, affine=True),
             nn.LeakyReLU(0.01, inplace=True),
-            nn.Conv2d(channels, channels, 3, padding=1, bias=False),
-            nn.Dropout2d(dropout),
-            nn.InstanceNorm2d(channels, affine=True),
+            L["conv"](channels, channels, 3, padding=1, bias=False),
+            L["dropout"](dropout),
+            L["norm"](channels, affine=True),
             nn.LeakyReLU(0.01, inplace=True),
-            nn.Conv2d(channels, channels, 3, padding=1, bias=False),
+            L["conv"](channels, channels, 3, padding=1, bias=False),
         )
 
     def forward(self, x):
@@ -119,22 +140,24 @@ class ContextModule(nn.Module):
 
 
 class UpsamplingModule(nn.Module):
+    """Double the resolution (nearest neighbour), then a 3x3 conv to halve the channels."""
 
-    def __init__(self, in_channels, out_channels):
+    def __init__(self, in_channels, out_channels, dims=2):
         super().__init__()
         self.upsample = nn.Upsample(scale_factor=2, mode="nearest")
-        self.conv = ConvNormAct(in_channels, out_channels, kernel_size=3)
+        self.conv = ConvNormAct(in_channels, out_channels, kernel_size=3, dims=dims)
 
     def forward(self, x):
         return self.conv(self.upsample(x))
 
 
 class LocalisationModule(nn.Sequential):
+    """After joining the skip connection: 3x3 conv, then 1x1 conv to halve the channels."""
 
-    def __init__(self, in_channels, out_channels):
+    def __init__(self, in_channels, out_channels, dims=2):
         super().__init__(
-            ConvNormAct(in_channels, in_channels, kernel_size=3),
-            ConvNormAct(in_channels, out_channels, kernel_size=1),
+            ConvNormAct(in_channels, in_channels, kernel_size=3, dims=dims),
+            ConvNormAct(in_channels, out_channels, kernel_size=1, dims=dims),
         )
 
 
