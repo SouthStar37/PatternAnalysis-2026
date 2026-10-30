@@ -303,13 +303,46 @@ def load_volume(path, is_label=False):
 
 # ---- leakage-free splitting -----
 
-# split_from_2d(root) -> {split: {case number: set of weeks}} from the 2D filenames
+def weeks_from_2d(root=DATA_ROOT):
+    out = {}
+    for split, (img_dir, _) in SPLITS_2D.items():
+        weeks = defaultdict(set)
+        for p in (Path(root) / SLICE_DIR / img_dir).glob("*.nii*"):
+            case, week, _ = parse_key(p.name)
+            weeks[case].add(week)
+        out[split] = dict(weeks)
+    return out
 
-# split_volumes(pairs, mode="match2d") -> {split: [pairs]}
-#   - each 3D patient goes in the same split as its 2D case (case_006 -> B006),
-#     so the 2D and 3D models are tested on the same patients
-#   - compare weeks per patient between 2D and 3D: confirms the mapping is right
-#   - mode="random": seeded split by patient instead
+
+def split_volumes(pairs, root=DATA_ROOT, mode="match2d", seed=42):
+    patients = sorted({p["patient"] for p in pairs})
+    number_of = {p["patient"]: p["patient_num"] for p in pairs}
+    warnings = []
+    if mode == "random":
+        groups = patient_level_split(patients, seed=seed)
+    elif mode == "match2d":
+        weeks_2d = weeks_from_2d(root)
+        split_of_case = {case: split for split, cases in weeks_2d.items() for case in cases}
+        numbers = list(number_of.values())
+        clashes = sorted({n for n in numbers if numbers.count(n) > 1})
+        if clashes:
+            raise RuntimeError(f"Different 3D patients share the numbers {clashes}; cannot match to 2D")
+        missing = [pt for pt in patients if number_of[pt] not in split_of_case]
+        if missing:
+            raise RuntimeError(f"No 2D case for 3D patients {missing}; use mode='random'")
+        groups = {split: sorted(pt for pt in patients if split_of_case[number_of[pt]] == split)
+                  for split in SPLITS_2D}
+        for pt in patients:                                   # does case_006 really = B006?
+            weeks_3d = {p["week"] for p in pairs if p["patient"] == pt}
+            case = number_of[pt]
+            weeks_2d_case = weeks_2d[split_of_case[case]][case]
+            if weeks_3d != weeks_2d_case:
+                warnings.append(f"{pt}: 3D weeks {sorted(weeks_3d)} vs 2D case {case} weeks {sorted(weeks_2d_case)}")
+    else:
+        raise ValueError("mode must be 'match2d' or 'random'")
+    check_no_leakage(groups)
+    by_split = {split: [p for p in pairs if p["patient"] in set(groups[split])] for split in groups}
+    return by_split, groups, warnings
 
 # ---- data augmentation -----
 # augment_3d(x, y)
