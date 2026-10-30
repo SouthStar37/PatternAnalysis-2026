@@ -42,49 +42,46 @@ DIM_DEFAULTS = {
     "2d": {"batch_size": 16, "epochs": 60, "patience": 12},
     "3d": {"batch_size": 2, "epochs": 150, "patience": 30},
 }
-BASE_FILTERS = {"improved": 16, "unet": 32} 
-TARGET_DICE = {"2d": 0.75, "3d": 0.70} 
+TARGET_DICE = {"2d": 0.75, "3d": 0.70}
 
-# SHARED 
+SETTINGS = {
+    "data_root": DATA_ROOT, # HipMRI on Rangpur
+    "model": "improved", 
+    "base_filters": 16, 
+    "dropout": 0.3, 
+    "lr": 5e-4, 
+    "weight_decay": 1e-5,
+    "dice_weight": 1.0,
+    "ce_weight": 1.0,
+    "prostate_weight": 3.0,
+    "no_augment": False,
+    "no_amp": False,
+    "workers": 4, 
+    "seed": 42, 
+}
+CACHE_3D = "~/hipmri3d_cache"
+
+# SHARED
 
 def get_args():
-    ap = argparse.ArgumentParser(description="Train a U-Net on HipMRI")
+    ap = argparse.ArgumentParser(description="Train the Improved U-Net on HipMRI")
     ap.add_argument("--dim", default="2d", choices=["2d", "3d"])
-    ap.add_argument("--model", default="improved", choices=["improved", "unet"])
-    ap.add_argument("--data-root", default=DATA_ROOT)
-    ap.add_argument("--out", default=None, help="output folder (default runs/<model><dim>)")
-    ap.add_argument("--epochs", type=int, default=None)
-    ap.add_argument("--batch-size", type=int, default=None)
-    ap.add_argument("--lr", type=float, default=5e-4)
-    ap.add_argument("--weight-decay", type=float, default=1e-5)
-    ap.add_argument("--base-filters", type=int, default=None)
-    ap.add_argument("--dropout", type=float, default=0.3)
-    ap.add_argument("--dice-weight", type=float, default=1.0)
-    ap.add_argument("--ce-weight", type=float, default=1.0)
-    ap.add_argument("--prostate-weight", type=float, default=3.0,
-                    help="2D: slices with prostate are drawn this many times more often (1 = off)")
-    ap.add_argument("--patience", type=int, default=None, help="early stopping: epochs without improvement")
-    ap.add_argument("--no-augment", action="store_true")
+    ap.add_argument("--epochs", type=int, default=None, help="default 60 (2D) / 150 (3D)")
     ap.add_argument("--max-scans", type=int, default=None,
                     help="quick tests: only load N scans (2D) or N volumes (3D) per split")
-    ap.add_argument("--cache-dir", default=None,
-                    help="3D: save the cropped volumes here so later runs load in seconds (uses a few GB)")
-    ap.add_argument("--workers", type=int, default=4)
-    ap.add_argument("--no-amp", action="store_true", help="turn off mixed precision")
+    ap.add_argument("--out", default=None, help="output folder (default runs/improved<dim>)")
     ap.add_argument("--resume", action="store_true", help="continue from <out>/last.pt")
-    ap.add_argument("--seed", type=int, default=42)
     args = ap.parse_args()
 
-    # fill in the defaults that depend on --dim / --model
-    for key, value in DIM_DEFAULTS[args.dim].items():
-        if getattr(args, key) is None:
+    vars(args).update(SETTINGS)
+    for key, value in DIM_DEFAULTS[args.dim].items():      # batch size, epochs, patience per --dim
+        if getattr(args, key, None) is None:
             setattr(args, key, value)
-    if args.base_filters is None:
-        args.base_filters = BASE_FILTERS[args.model]
+    # cache only full 3D runs (a --max-scans test would leave extra cache files behind)
+    args.cache_dir = CACHE_3D if args.dim == "3d" and not args.max_scans else None
     if args.out is None:
-        args.out = f"runs/{args.model}{args.dim}"
+        args.out = f"runs/improved{args.dim}"
     return args
-
 
 def set_seed(seed):
     """Same seed -> same initial weights, same shuffling, same augmentation: reproducible runs."""
