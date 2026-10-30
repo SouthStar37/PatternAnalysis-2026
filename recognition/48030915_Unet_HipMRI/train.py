@@ -5,14 +5,13 @@ The model comes from modules.py and the data from dataset.py (spec rule). Losses
 per-class Dice are plotted after every epoch.
 
 Run:
-    python train.py --dim 2d --model improved          # 2D Improved U-Net
-    python train.py --dim 2d --model unet              # plain 2D U-Net (tutorial style)
+    python train.py --dim 2d                           # 2D Improved U-Net
     python train.py --dim 2d --max-scans 4 --epochs 2  # quick test on a few scans
     python train.py --dim 2d --resume                  # continue after a Rangpur time-out
     python train.py --dim 3d                           # 3D Improved U-Net
     python train.py --dim 3d --max-scans 4 --epochs 2  # quick 3D test on a few volumes
 
-Outputs in --out (default runs/<model><dim>, e.g. runs/improved2d):
+Outputs in --out (default runs/improved<dim>, e.g. runs/improved2d):
     best.pt, last.pt     checkpoints (weights + all settings; last.pt also has the optimiser state)
     config.json          all settings
     history.csv          per epoch: losses, validation Dice per class, learning rate, time, peak VRAM
@@ -45,32 +44,31 @@ DIM_DEFAULTS = {
 TARGET_DICE = {"2d": 0.75, "3d": 0.70}
 
 SETTINGS = {
-    "data_root": DATA_ROOT, # HipMRI on Rangpur
-    "model": "improved", 
-    "base_filters": 16, 
-    "dropout": 0.3, 
-    "lr": 5e-4, 
+    "data_root": DATA_ROOT,    # HipMRI on Rangpur
+    "model": "improved",       # Improved U-Net (Isensee et al. 2018)
+    "base_filters": 16,        # channels at full resolution, doubled at each level
+    "dropout": 0.3,            # in the context modules
     "weight_decay": 1e-5,
-    "dice_weight": 1.0,
-    "ce_weight": 1.0,
-    "prostate_weight": 3.0,
+    "ce_weight": 1.0,          # loss = dice_weight * Dice loss + ce_weight * cross-entropy
+    "prostate_weight": 3.0,    # 2D: slices with prostate are drawn this many times more often
     "no_augment": False,
-    "no_amp": False,
-    "workers": 4, 
-    "seed": 42, 
+    "no_amp": False,           # mixed precision on the GPU
+    "workers": 4,              # data-loading processes
 }
-CACHE_3D = "~/hipmri3d_cache"
+CACHE_3D = "~/hipmri3d_cache"  # cropped 3D volumes are saved here (about 3 GB), so later runs load in seconds
 
 # SHARED
-
 def get_args():
     ap = argparse.ArgumentParser(description="Train the Improved U-Net on HipMRI")
     ap.add_argument("--dim", default="2d", choices=["2d", "3d"])
-    ap.add_argument("--epochs", type=int, default=None, help="default 60 (2D) / 150 (3D)")
-    ap.add_argument("--max-scans", type=int, default=None,
-                    help="quick tests: only load N scans (2D) or N volumes (3D) per split")
-    ap.add_argument("--out", default=None, help="output folder (default runs/improved<dim>)")
-    ap.add_argument("--resume", action="store_true", help="continue from <out>/last.pt")
+    ap.add_argument("--out", default=None)                    # output folder, one per experiment
+    ap.add_argument("--epochs", type=int, default=None)       # default 60 (2D) / 150 (3D)
+    ap.add_argument("--patience", type=int, default=None)     # early stopping, default 12 (2D) / 30 (3D)
+    ap.add_argument("--lr", type=float, default=5e-4)         # AdamW learning rate, cosine decay to 1% of it
+    ap.add_argument("--dice-weight", type=float, default=1.0) # loss = dice_weight * Dice loss + cross-entropy
+    ap.add_argument("--seed", type=int, default=42)           # repeat the final model with other seeds
+    ap.add_argument("--max-scans", type=int, default=None)    # quick tests: only N scans / volumes per split
+    ap.add_argument("--resume", action="store_true")          # continue from <out>/last.pt
     args = ap.parse_args()
 
     vars(args).update(SETTINGS)
