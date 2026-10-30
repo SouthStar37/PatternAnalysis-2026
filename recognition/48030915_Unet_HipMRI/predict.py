@@ -3,13 +3,11 @@ predict.py - Load a trained model, run it on the test cases, print the results a
 
 Run:
     python predict.py --checkpoint runs/improved2d/best.pt [--split validate]
-    python predict.py --compare A/results.json B/results.json     # README comparison table
+    python predict.py --compare A/results.json B/results.json 
+    python predict.py --checkpoint runs/improved3d/best.pt [--split validate]
 
 Outputs in <checkpoint folder>/eval_<split>: results.json, per_scan.csv, failure_cases.png,
 best_case.png, band_boxplot.png, slice_profile.png.
-
-2D: each scan's predicted slices are stacked back into a (slices, 256, 128) block, so the 2D
-model is scored per scan with the same metrics as the 3D model (axis 2 = head-feet).
 """
 import argparse
 import json
@@ -238,12 +236,21 @@ def main():
     out = Path(args.out or Path(args.checkpoint).parent / f"eval_{args.split}")
     out.mkdir(parents=True, exist_ok=True)
     print(f"Model {cfg['model']} {dims}D from epoch {epoch} ({count_parameters(model):,} parameters)", flush=True)
-    if dims != 2:
-        raise NotImplementedError("3D evaluation is added after the 3D model is trained")
+    if dims == 2:
+        ds, preds, rows, profiles, timing = evaluate_2d(model, cfg, args, device)
+        all_preds, all_labels = preds, ds.labels
 
-    ds, preds, rows, profiles, timing = evaluate_2d(model, cfg, args, device)
-    pooled = SegMetrics()                                   # Dice / IoU over every test pixel
-    pooled.update(torch.from_numpy(preds).long(), torch.from_numpy(ds.labels).long())
+        def make_cases(picked, show="errors"):
+            return figure_cases_2d(ds, preds, picked, args.band_fraction, show)
+    else:
+        images, labels, preds, rows, profiles, timing = evaluate_3d(model, cfg, args, device)
+        all_preds, all_labels = np.stack(preds), np.stack(labels)
+
+        def make_cases(picked, show="errors"):
+            return figure_cases_3d(images, labels, preds, rows, picked, args.band_fraction, show)
+
+    pooled = SegMetrics()  
+    pooled.update(torch.from_numpy(all_preds).long(), torch.from_numpy(all_labels).long())
     pooled_dice = pooled.dice().tolist()
 
     summary = {
@@ -256,15 +263,17 @@ def main():
                                  for k in PATIENT_METRICS} for c in sorted({r["case"] for r in rows})},
         "slice_profile": profile_plot(profiles, out / "slice_profile.png") if profiles else None,
         **timing, "device": str(device),
-        "target_dice": TARGET_DICE[dims], "meets_target": pooled_dice[PROSTATE] >= TARGET_DICE[dims],
+        "target_dice": TARGET_DICE[dims], "meets_target": pooled_dice[PROSTATE] >= TARGET_DICE[dims], 
+        "evaluated_on": "whole 2D slices" if dims == 2 else f"central {tuple(cfg['crop_size'])} crop",
+        "prostate_voxels_outside_crop": sum(r.get("prostate_voxels_outside_crop", 0) for r in rows),
     }
     save_json(summary, out / "results.json")
     write_csv(rows, out / "per_scan.csv")
 
     ranked = sorted((r for r in rows if not np.isnan(r["dice_prostate"])), key=lambda r: r["dice_prostate"])
     if ranked:
-        failure_figure(figure_cases_2d(ds, preds, ranked[:args.n_failures], args.band_fraction), out / "failure_cases.png")
-        failure_figure(figure_cases_2d(ds, preds, ranked[-1:], args.band_fraction, show="prostate"), out / "best_case.png")
+        failure_figure(make_cases(ranked[:args.n_failures]), out / "failure_cases.png")
+        failure_figure(make_cases(ranked[-1:], show="prostate"), out / "best_case.png")
     band_boxplot(rows, out / "band_boxplot.png", TARGET_DICE[dims])
     print_results(summary)
     print(f"Saved to {out}")
