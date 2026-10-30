@@ -15,6 +15,12 @@ import torch
 import torch.nn.functional as F
 from torch.utils.data import Dataset, WeightedRandomSampler
 
+import hashlib
+import json
+import math
+import re
+from collections import OrderedDict, defaultdict
+
 # SHARED (used by both 2D and 3D)
 
 DATA_ROOT = "/home/groups/comp3710/HipMRI_Study_open"
@@ -242,14 +248,40 @@ def augment_2d(images, labels, max_rotation_degrees=10.0, scale_range=(0.9, 1.1)
 
 # 3D HipMRI dataset (semantic_MRs + semantic_labels_only)
 
+CROP_3D = (128, 128, 128) 
+SHIFT_3D = 16  # training crops are randomly shifted by up to this many voxels
+_KEY_3D = re.compile(r"([A-Za-z]*)(\d+)_week_?(\d+)", re.I)
+
+
 # ---- data loader -----
 
-# parse_volume_key(filename) -> (patient "B006", patient number 6, week 0)
+def parse_volume_key(filename):
+    m = _KEY_3D.search(filename)
+    if m is None:
+        raise ValueError(f"Cannot parse patient/week from '{filename}'")
+    return f"{m.group(1).upper()}{m.group(2)}", int(m.group(2)), int(m.group(3))
 
-# list_volume_pairs(root) -> [{id, patient, patient_num, week, image path, label path}]
-#   - 211 pairs, 38 patients
 
-# load_volume(path) -> array + voxel spacing (mm) from the header
+def list_volume_pairs(root=DATA_ROOT):
+    root = Path(root)
+    images = {parse_volume_key(p.name): p for p in (root / IMAGE_DIR_3D).glob("*.nii*")}
+    labels = {parse_volume_key(p.name): p for p in (root / LABEL_DIR_3D).glob("*.nii*")}
+    if not images:
+        raise FileNotFoundError(f"No volumes found in {root / IMAGE_DIR_3D}")
+    if set(images) != set(labels):
+        raise RuntimeError(f"{len(set(images) - set(labels))} volumes without labels, "
+                           f"{len(set(labels) - set(images))} labels without volumes")
+    pairs = []
+    for patient, number, week in sorted(images):
+        key = (patient, number, week)
+        pairs.append({"id": f"{patient}_Week{week}", "patient": patient, "patient_num": number, "week": week,
+                      "image": str(images[key]), "label": str(labels[key])})
+    return pairs
+
+
+def load_volume(path, is_label=False):
+    spacing = tuple(float(z) for z in nib.load(str(path)).header.get_zooms()[:3])
+    return load_nifti(path, is_label), spacing
 
 # class HipMRIVolumes(Dataset)
 #   __init__(pairs, crop_centre, crop=(128,128,128), shift=16, train=False, cache_dir=None)
