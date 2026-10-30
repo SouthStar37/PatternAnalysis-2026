@@ -283,12 +283,106 @@ def load_volume(path, is_label=False):
     spacing = tuple(float(z) for z in nib.load(str(path)).header.get_zooms()[:3])
     return load_nifti(path, is_label), spacing
 
-# class HipMRIVolumes(Dataset)
-#   __init__(pairs, crop_centre, crop=(128,128,128), shift=16, train=False, cache_dir=None)
-#       - load each volume, cut a window around the crop centre, normalise, cache to disk
-#   __getitem__(i) -> image (1, X, Y, Z), label (X, Y, Z)
-#       - train=True: random crop inside the window (shift augmentation)
-#       - train=False: the fixed central crop (validation / test / predict)
+try:
+    from tqdm import tqdm
+except ImportError: 
+    def tqdm(items, **kwargs):
+        return items
+
+def load_data_3D(image_names, norm_image=False, dtype=np.float32, get_affines=False, early_stop=False,
+                 centre=None, crop=CROP_3D, shift=SHIFT_3D):
+    affines = []
+
+    num = len(image_names)
+    first_case = load_nifti(image_names[0], is_label=(dtype == np.uint8))
+    if centre is None:
+        rows, cols, depth = first_case.shape
+        window_size = None
+    else:
+        _, _, window_size = crop_windows(first_case.shape, centre, crop, shift)
+        rows, cols, depth = window_size
+    images = np.zeros((num, rows, cols, depth), dtype=dtype)
+
+    for i, in_name in enumerate(tqdm(image_names, desc="loading")):
+        nifti_image = nib.load(str(in_name))
+        in_image = load_nifti(in_name, is_label=(dtype == np.uint8)) 
+        info = {"affine": nifti_image.affine.tolist(), "shape": list(in_image.shape),
+                "spacing": [float(z) for z in nifti_image.header.get_zooms()[:3]]}
+        if centre is None:
+            in_image = in_image[:rows, :cols, :depth]
+            offset, crop_here = [0, 0, 0], in_image.shape
+        else:
+            eval_start, window_start, _ = crop_windows(in_image.shape, centre, crop, shift, window_size)
+            fill = 0 if dtype == np.uint8 else float(in_image.min())
+            in_image = extract_window(in_image, window_start, window_size, fill=fill)
+            offset = [e - w for e, w in zip(eval_start, window_start)]
+            crop_here = crop
+            info.update(eval_start=eval_start, eval_offset=offset)
+        in_image = in_image.astype(dtype)
+        if norm_image:
+            central = in_image[tuple(slice(o, o + n) for o, n in zip(offset, crop_here))]
+            mean, std = float(central.mean()), float(central.std())
+            in_image = (in_image - mean) / (std + 1e-8)
+            info.update(norm_mean=mean, norm_std=std)
+        images[i, :in_image.shape[0], :in_image.shape[1], :in_image.shape[2]] = in_image
+
+        affines.append(info)
+        if i > 20 and early_stop:
+            break
+
+    if get_affines:
+        return images, affines
+    return images
+
+class HipMRIVolumes(Dataset):
+    def __init__(self, pairs, centre, crop=CROP_3D, shift=SHIFT_3D, train=False, cache_dir=None):
+        self.pairs, self.train = pairs, train
+        self.centre, self.crop, self.shift = [int(c) for c in centre], tuple(crop), shift
+        self.ids = [p["id"] for p in pairs]
+        cache = self._cache_path(cache_dir)
+        if cache is not None and cache.exists():
+            saved = np.load(cache)
+            self.images, self.labels = saved["images"], saved["labels"]
+            self.meta = json.loads(str(saved["meta"]))
+            return
+
+        settings = {"centre": self.centre, "crop": self.crop, "shift": self.shift}
+        self.images, self.meta = load_data_3D([p["image"] for p in pairs], norm_image=True,
+                                              get_affines=True, **settings)
+        self.labels, label_meta = load_data_3D([p["label"] for p in pairs], dtype=np.uint8,
+                                               get_affines=True, **settings)
+        for pair, image_info, label_info in zip(pairs, self.meta, label_meta):
+            if image_info["shape"] != label_info["shape"]:
+                raise RuntimeError(f"{pair['id']}: image {image_info['shape']} and label {label_info['shape']} differ")
+        if cache is not None:
+            np.savez(cache, images=self.images, labels=self.labels, meta=json.dumps(self.meta))
+
+    def _cache_path(self, cache_dir):
+        if not cache_dir:
+            return None
+        folder = Path(cache_dir).expanduser()
+        folder.mkdir(parents=True, exist_ok=True)
+        settings = json.dumps([self.ids, self.centre, list(self.crop), self.shift])
+        return folder / f"volumes_{len(self.ids)}_{hashlib.md5(settings.encode()).hexdigest()[:10]}.npz"
+
+    def __len__(self):
+        return len(self.images)
+
+    def __getitem__(self, i):
+        image, label = self.images[i], self.labels[i]
+        if self.train:
+            offset = [int(torch.randint(0, w - n + 1, (1,))) for w, n in zip(image.shape, self.crop)]
+        else:
+            offset = self.meta[i]["eval_offset"]
+        region = tuple(slice(o, o + n) for o, n in zip(offset, self.crop))
+        return (torch.from_numpy(np.ascontiguousarray(image[region])).unsqueeze(0),
+                torch.from_numpy(label[region].astype(np.int64)))
+
+    def summary(self):
+        n_patients = len({p["patient"] for p in self.pairs})
+        counts = np.bincount(self.labels.ravel(), minlength=N_CLASSES)
+        return (f"{len(self)} volumes from {n_patients} patients, stored {self.images.shape[1:]}, "
+                f"crop {self.crop}, prostate {counts[PROSTATE] / counts.sum():.2%} of stored voxels")
 
 # ---- preprocessing -----
 
