@@ -264,30 +264,54 @@ def parse_volume_key(filename):
 
 def list_volume_pairs(root=DATA_ROOT):
     root = Path(root)
-    images = {parse_volume_key(p.name): p for p in (root / IMAGE_DIR_3D).glob("*.nii*")}
-    labels = {parse_volume_key(p.name): p for p in (root / LABEL_DIR_3D).glob("*.nii*")}
+    skipped = []
+
+    def index(folder):
+        found = {}
+        for p in sorted((root / folder).glob("*.nii*")):
+            try:
+                key = parse_volume_key(p.name)
+            except ValueError:
+                skipped.append(f"{folder}/{p.name}: cannot read patient/week from the name")
+                continue
+            if key in found:
+                skipped.append(f"{folder}/{p.name}: duplicate of {found[key].name}")
+                continue
+            found[key] = p
+        return found
+
+    images, labels = index(IMAGE_DIR_3D), index(LABEL_DIR_3D)
     if not images:
         raise FileNotFoundError(f"No volumes found in {root / IMAGE_DIR_3D}")
-    if set(images) != set(labels):
-        raise RuntimeError(f"{len(set(images) - set(labels))} volumes without labels, "
-                           f"{len(set(labels) - set(images))} labels without volumes")
-    pairs = []
-    for patient, number, week in sorted(images):
-        key = (patient, number, week)
-        pairs.append({"id": f"{patient}_Week{week}", "patient": patient, "patient_num": number, "week": week,
-                      "image": str(images[key]), "label": str(labels[key])})
-    return pairs
+    for patient, _, week in sorted(set(images) - set(labels)):
+        skipped.append(f"{patient}_Week{week}: image has no label")
+    for patient, _, week in sorted(set(labels) - set(images)):
+        skipped.append(f"{patient}_Week{week}: label has no image")
 
+    pairs = []
+    for key in sorted(set(images) & set(labels)):
+        patient, number, week = key
+        scan_id = f"{patient}_Week{week}"
+        image_shape = nib.load(str(images[key])).shape[:3]
+        label_shape = nib.load(str(labels[key])).shape[:3]
+        if image_shape != label_shape:
+            skipped.append(f"{scan_id}: image {image_shape} and label {label_shape} differ")
+            continue
+        pairs.append({"id": scan_id, "patient": patient, "patient_num": number, "week": week,
+                      "image": str(images[key]), "label": str(labels[key])})
+
+    print(f"Found {len(pairs)} usable 3D scans, skipped {len(skipped)}", flush=True)
+    for reason in skipped:
+        print("  skipped:", reason, flush=True)
+    if not pairs:
+        raise RuntimeError("No usable 3D scans")
+    return pairs
 
 def load_volume(path, is_label=False):
     spacing = tuple(float(z) for z in nib.load(str(path)).header.get_zooms()[:3])
     return load_nifti(path, is_label), spacing
 
-try:
-    from tqdm import tqdm
-except ImportError: 
-    def tqdm(items, **kwargs):
-        return items
+
 
 def load_data_3D(image_names, norm_image=False, dtype=np.float32, get_affines=False, early_stop=False,
                  centre=None, crop=CROP_3D, shift=SHIFT_3D):
