@@ -327,7 +327,7 @@ def load_data_3D(image_names, norm_image=False, dtype=np.float32, get_affines=Fa
         rows, cols, depth = window_size
     images = np.zeros((num, rows, cols, depth), dtype=dtype)
 
-    for i, in_name in enumerate(tqdm(image_names, desc="loading")):
+    for i, in_name in enumerate(tqdm(image_names)):
         nifti_image = nib.load(str(in_name))
         in_image = load_nifti(in_name, is_label=(dtype == np.uint8)) 
         info = {"affine": nifti_image.affine.tolist(), "shape": list(in_image.shape),
@@ -450,45 +450,31 @@ def extract_window(volume, start, size, fill=0):
 
 # ---- leakage-free splitting -----
 
-def weeks_from_2d(root=DATA_ROOT):
-    out = {}
-    for split, (img_dir, _) in SPLITS_2D.items():
-        weeks = defaultdict(set)
+def split_volumes(pairs, root=DATA_ROOT):
+    cases_2d = split_cases(root) 
+    check_no_leakage(cases_2d) 
+    split_of_case = {case: split for split, cases in cases_2d.items() for case in cases}
+    weeks_2d = defaultdict(set)
+    for img_dir, _ in SPLITS_2D.values():
         for p in (Path(root) / SLICE_DIR / img_dir).glob("*.nii*"):
             case, week, _ = parse_key(p.name)
-            weeks[case].add(week)
-        out[split] = dict(weeks)
-    return out
+            weeks_2d[case].add(week)
 
+    groups, warnings = {split: [] for split in SPLITS_2D}, []
+    for patient in sorted({p["patient"] for p in pairs}):
+        scans = [p for p in pairs if p["patient"] == patient]
+        case = scans[0]["patient_num"]
+        if case not in split_of_case:
+            groups["train"].append(patient)
+            warnings.append(f"{patient}: no 2D case {case}, put in train")
+            continue
+        groups[split_of_case[case]].append(patient)
+        weeks_3d = {p["week"] for p in scans}
+        if weeks_3d != weeks_2d[case]:
+            warnings.append(f"{patient}: 3D weeks {sorted(weeks_3d)} vs 2D weeks {sorted(weeks_2d[case])}")
 
-def split_volumes(pairs, root=DATA_ROOT, mode="match2d", seed=42):
-    patients = sorted({p["patient"] for p in pairs})
-    number_of = {p["patient"]: p["patient_num"] for p in pairs}
-    warnings = []
-    if mode == "random":
-        groups = patient_level_split(patients, seed=seed)
-    elif mode == "match2d":
-        weeks_2d = weeks_from_2d(root)
-        split_of_case = {case: split for split, cases in weeks_2d.items() for case in cases}
-        numbers = list(number_of.values())
-        clashes = sorted({n for n in numbers if numbers.count(n) > 1})
-        if clashes:
-            raise RuntimeError(f"Different 3D patients share the numbers {clashes}; cannot match to 2D")
-        missing = [pt for pt in patients if number_of[pt] not in split_of_case]
-        if missing:
-            raise RuntimeError(f"No 2D case for 3D patients {missing}; use mode='random'")
-        groups = {split: sorted(pt for pt in patients if split_of_case[number_of[pt]] == split)
-                  for split in SPLITS_2D}
-        for pt in patients:                                   # does case_006 really = B006?
-            weeks_3d = {p["week"] for p in pairs if p["patient"] == pt}
-            case = number_of[pt]
-            weeks_2d_case = weeks_2d[split_of_case[case]][case]
-            if weeks_3d != weeks_2d_case:
-                warnings.append(f"{pt}: 3D weeks {sorted(weeks_3d)} vs 2D case {case} weeks {sorted(weeks_2d_case)}")
-    else:
-        raise ValueError("mode must be 'match2d' or 'random'")
-    check_no_leakage(groups)
-    by_split = {split: [p for p in pairs if p["patient"] in set(groups[split])] for split in groups}
+    check_no_leakage(groups)                           # no 3D patient in two splits
+    by_split = {split: [p for p in pairs if p["patient"] in groups[split]] for split in groups}
     return by_split, groups, warnings
 
 # ---- data augmentation -----
