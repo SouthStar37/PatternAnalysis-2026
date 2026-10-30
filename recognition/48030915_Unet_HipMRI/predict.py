@@ -86,9 +86,11 @@ def print_results(s):
         print(f"HD95 median {ps['hd95_mm']['median']:.1f} mm (range {ps['hd95_mm']['min']:.1f}-{ps['hd95_mm']['max']:.1f})")
     print(f"Leakage per scan: rectum {mean_sd(ps['leak_rectum_ml'], '.2f')} ml, "
           f"bladder {mean_sd(ps['leak_bladder_ml'], '.2f')} ml")
-    print(f"Inference {s['inference_ms_per_slice']:.2f} ms/slice, {s['inference_s_per_scan']:.2f} s/scan, "
+    per_slice = f"{s['inference_ms_per_slice']:.2f} ms/slice, " if s.get("inference_ms_per_slice") else ""
+    print(f"Inference {per_slice}{s['inference_s_per_scan']:.2f} s/scan, "
           f"peak VRAM {s['peak_inference_vram_mb']:.0f} MB, {s['n_parameters']:,} parameters")
-
+    if s.get("prostate_voxels_outside_crop"):
+        print(f"WARNING: {s['prostate_voxels_outside_crop']} true prostate voxels lie outside the 3D crop")
 
 def compare(path_a, path_b):
     """Markdown table of two results.json files (e.g. 2D vs 3D on the same test patients)."""
@@ -141,6 +143,14 @@ def evaluate_2d(model, cfg, args, device):
               "peak_inference_vram_mb": torch.cuda.max_memory_allocated() / 2**20 if gpu else 0.0}
     return ds, preds, rows, profiles, timing
 
+def band_lines(true_block, band_fraction):
+    """Row positions of the apex/base band edges, drawn as dashed lines on the error panel."""
+    bands = band_masks(true_block, band_fraction)
+    if not bands:
+        return []
+    z0, z1 = bands[2]
+    width = max(1, round(band_fraction * (z1 - z0 + 1)))
+    return [z0 + width - 0.5, z1 - width + 0.5]
 
 def figure_cases_2d(ds, preds, picked, band_fraction, show="errors"):
     cases = []
@@ -151,13 +161,9 @@ def figure_cases_2d(ds, preds, picked, band_fraction, show="errors"):
         else:
             scores = [(ds.labels[j] == PROSTATE).sum() for j in idx]
         i = idx[int(np.argmax(scores))]
-        bands, lines = band_masks(ds.labels[idx], band_fraction), []
-        if bands:
-            z0, z1 = bands[2]
-            width = max(1, round(band_fraction * (z1 - z0 + 1)))
-            lines = [z0 + width - 0.5, z1 - width + 0.5]
         cases.append({"title": f"case {r['case']} week {r['week']} slice {ds.keys[i][2]}", "image": ds.images[i].T,
-                      "true": ds.labels[i].T, "pred": preds[i].T, "dice": r["dice_prostate"], "band_lines": lines})
+                      "true": ds.labels[i].T, "pred": preds[i].T, "dice": r["dice_prostate"],
+                      "band_lines": band_lines(ds.labels[idx], band_fraction)})
     return cases
 
 # main
@@ -198,7 +204,7 @@ def main():
     ranked = sorted((r for r in rows if not np.isnan(r["dice_prostate"])), key=lambda r: r["dice_prostate"])
     if ranked:
         failure_figure(figure_cases_2d(ds, preds, ranked[:args.n_failures], args.band_fraction), out / "failure_cases.png")
-        figure_cases_2d(ds, preds, ranked[-1:], args.band_fraction, show="prostate")
+        failure_figure(figure_cases_2d(ds, preds, ranked[-1:], args.band_fraction, show="prostate"), out / "best_case.png")
     band_boxplot(rows, out / "band_boxplot.png", TARGET_DICE[dims])
     print_results(summary)
     print(f"Saved to {out}")
