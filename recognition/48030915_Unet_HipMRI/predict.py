@@ -142,12 +142,15 @@ def evaluate_2d(model, cfg, args, device):
     return ds, preds, rows, profiles, timing
 
 
-def figure_cases_2d(ds, preds, picked, band_fraction):
-    """For each picked scan: its slice with the most prostate errors, head-up, with apex/base band edges."""
+def figure_cases_2d(ds, preds, picked, band_fraction, show="errors"):
     cases = []
     for r in picked:
         idx = ds.scan_index[(r["case"], r["week"])]
-        i = idx[int(np.argmax([((preds[j] == PROSTATE) != (ds.labels[j] == PROSTATE)).sum() for j in idx]))]
+        if show == "errors":
+            scores = [((preds[j] == PROSTATE) != (ds.labels[j] == PROSTATE)).sum() for j in idx]
+        else:
+            scores = [(ds.labels[j] == PROSTATE).sum() for j in idx]
+        i = idx[int(np.argmax(scores))]
         bands, lines = band_masks(ds.labels[idx], band_fraction), []
         if bands:
             z0, z1 = bands[2]
@@ -195,7 +198,7 @@ def main():
     ranked = sorted((r for r in rows if not np.isnan(r["dice_prostate"])), key=lambda r: r["dice_prostate"])
     if ranked:
         failure_figure(figure_cases_2d(ds, preds, ranked[:args.n_failures], args.band_fraction), out / "failure_cases.png")
-        failure_figure(figure_cases_2d(ds, preds, ranked[-1:], args.band_fraction), out / "best_case.png")
+        figure_cases_2d(ds, preds, ranked[-1:], args.band_fraction, show="prostate")
     band_boxplot(rows, out / "band_boxplot.png", TARGET_DICE[dims])
     print_results(summary)
     print(f"Saved to {out}")
