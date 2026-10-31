@@ -94,15 +94,10 @@ def list_all_pairs(root):
     return sorted((p for split in SPLITS_2D for p in list_pairs(root, split)), key=lambda p: p[0])
 
 class HipMRISlices(Dataset):
-    
-    def __init__(self, root=DATA_ROOT, split="train", shape=SLICE_SHAPE, max_scans=None, cases=None, workers=8):
+    def __init__(self, root=DATA_ROOT, split="train", shape=SLICE_SHAPE, max_scans=None, workers=8):
         self.split, self.shape = split, tuple(shape)
-        if cases is None:
-            pairs = list_pairs(root, split)
-        else:
-            keep = set(cases)
-            pairs = [p for p in list_all_pairs(root) if p[0][0] in keep]
-        if max_scans:
+        pairs = list_pairs(root, split)
+        if max_scans: 
             first = list(OrderedDict.fromkeys(k[:2] for k, _, _ in pairs))[:max_scans]
             pairs = [p for p in pairs if p[0][:2] in set(first)]
         if not pairs:
@@ -110,14 +105,15 @@ class HipMRISlices(Dataset):
 
         with ThreadPoolExecutor(max_workers=workers) as ex:      # reading 11k files in parallel
             loaded = list(ex.map(self._load_pair, pairs))
+
         self.images = np.stack([img for img, _ in loaded])       # (N, H, W) float32
         self.labels = np.stack([lab for _, lab in loaded])       # (N, H, W) uint8
         bad = np.setdiff1d(np.unique(self.labels), np.arange(N_CLASSES))
         if bad.size:
             raise ValueError(f"Unexpected label values {bad.tolist()} in split '{split}'")
 
-        self.keys = [k for k, _, _ in pairs]                     # (case, week, slice) per item
-        self.scan_index = OrderedDict()                           # (case, week) -> slice indices
+        self.keys = [k for k, _, _ in pairs]
+        self.scan_index = OrderedDict()
         for i, (case, week, _) in enumerate(self.keys):
             self.scan_index.setdefault((case, week), []).append(i)
         self.cases = sorted({case for case, _ in self.scan_index})
@@ -179,22 +175,6 @@ def split_cases(root=DATA_ROOT):
         files = (Path(root) / SLICE_DIR / img_dir).glob("*.nii*")
         out[split] = sorted({parse_key(p.name)[0] for p in files})
     return out
-
-
-def patient_level_split(case_ids, val_frac=0.15, test_frac=0.15, seed=42):
-    """Randomly assign WHOLE patients to train/validate/test (optional alternative split)."""
-
-    cases = sorted(set(case_ids))
-    np.random.default_rng(seed).shuffle(cases)
-    n_test = max(1, round(test_frac * len(cases)))
-    n_val = max(1, round(val_frac * len(cases)))
-    split = {"test": sorted(cases[:n_test]),
-             "validate": sorted(cases[n_test:n_test + n_val]),
-             "train": sorted(cases[n_test + n_val:])}
-    check_no_leakage(split)
-
-    return split
-
 
 def prostate_sampler(dataset, weight=3.0, seed=0):
     """Sampler that draws slices containing prostate `weight` times more often.
