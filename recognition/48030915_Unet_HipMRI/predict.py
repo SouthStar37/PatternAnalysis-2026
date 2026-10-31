@@ -10,6 +10,7 @@ Outputs in <checkpoint folder>/eval_<split>: results.json, per_scan.csv, failure
 best_case.png, band_boxplot.png, slice_profile.png.
 """
 import argparse
+import csv
 import json
 import re
 import time
@@ -21,12 +22,12 @@ import torch
 
 from dataset import CLASS_NAMES, IMAGE_DIR_3D, PROSTATE, HipMRISlices, HipMRIVolumes, list_volume_pairs, load_volume
 from modules import SegMetrics, build_model, count_parameters
-from utils import BAND_NAMES, band_boxplot, band_masks, evaluate_scan, failure_figure, profile_plot, save_json, \
-    summarise, write_csv
+from utils import BAND_NAMES, band_boxplot, band_masks, evaluate_scan, failure_figure, profile_comparison_plot, \
+    profile_plot, save_json, summarise, write_csv
 
 TARGET_DICE = {2: 0.75, 3: 0.70}
 METRICS = ["dice_prostate", "iou_prostate", "dice_apex", "dice_middle", "dice_base", "hd95_mm", "asd_mm",
-           "leak_rectum_ml", "leak_bladder_ml", "dice_bladder", "dice_rectum"]
+           "leak_rectum_ml", "leak_bladder_ml", "dice_bladder", "dice_rectum", "prostate_pieces", "stray_prostate_ml"]
 PATIENT_METRICS = ["dice_prostate", "hd95_mm", "dice_apex", "dice_middle", "dice_base"]
 
 SETTINGS = {
@@ -86,28 +87,86 @@ def print_results(s):
         print(f"HD95 median {ps['hd95_mm']['median']:.1f} mm (range {ps['hd95_mm']['min']:.1f}-{ps['hd95_mm']['max']:.1f})")
     print(f"Leakage per scan: rectum {mean_sd(ps['leak_rectum_ml'], '.2f')} ml, "
           f"bladder {mean_sd(ps['leak_bladder_ml'], '.2f')} ml")
+    if ps.get("prostate_pieces"):
+        print(f"Prostate pieces per scan {mean_sd(ps['prostate_pieces'], '.1f')} (truth: 1), "
+              f"stray prostate outside the main piece {mean_sd(ps['stray_prostate_ml'], '.2f')} ml")
     per_slice = f"{s['inference_ms_per_slice']:.2f} ms/slice, " if s.get("inference_ms_per_slice") else ""
     print(f"Inference {per_slice}{s['inference_s_per_scan']:.2f} s/scan, "
           f"peak VRAM {s['peak_inference_vram_mb']:.0f} MB, {s['n_parameters']:,} parameters")
     if s.get("prostate_voxels_outside_crop"):
         print(f"WARNING: {s['prostate_voxels_outside_crop']} true prostate voxels lie outside the 3D crop")
 
+def read_per_scan(results_path):
+    with open(Path(results_path).parent / "per_scan.csv", newline="") as f:
+        return {(int(r["case"]), int(r["week"])): r for r in csv.DictReader(f)}
+
+
+def as_number(text):
+    try:
+        return float(text)
+    except (TypeError, ValueError):
+        return float("nan")
+
+
 def compare(path_a, path_b):
-    """Markdown table of two results.json files (e.g. 2D vs 3D on the same test patients)."""
+    results = [json.load(open(p)) for p in (path_a, path_b)]
+    names = [r["model"] for r in results]
+    short = [n.split()[-1] for n in names] if names[0] != names[1] else ["A", "B"]   # e.g. "2D", "3D"
+
+    # summary
     cols = [("Per scan", "dice_prostate", "mean", ".3f"), ("Apex", "dice_apex", "mean", ".3f"),
             ("Middle", "dice_middle", "mean", ".3f"), ("Base", "dice_base", "mean", ".3f"),
             ("HD95 median (mm)", "hd95_mm", "median", ".1f"), ("Rectum leak (ml)", "leak_rectum_ml", "mean", ".2f"),
-            ("Bladder leak (ml)", "leak_bladder_ml", "mean", ".2f")]
-    lines = ["| Model | Prostate Dice (pooled) | " + " | ".join(c[0] for c in cols) + " | Parameters | Inference / scan (s) |",
+            ("Bladder leak (ml)", "leak_bladder_ml", "mean", ".2f"), ("Pieces", "prostate_pieces", "mean", ".1f"),
+            ("Stray (ml)", "stray_prostate_ml", "mean", ".2f")]
+    lines = ["## Summary", "",
+             "| Model | Prostate Dice (pooled) | " + " | ".join(c[0] for c in cols) + " | Parameters | Inference / scan (s) |",
              "| --- |" + " --- |" * (len(cols) + 3)]
-    for r in (json.load(open(p)) for p in (path_a, path_b)):
+    for r in results:
         cells = [format(r["per_scan"][k][stat], f) if r["per_scan"].get(k) else "n/a" for _, k, stat, f in cols]
         lines.append(f"| {r['model']} | {r['pooled_dice']['prostate']:.3f} | " + " | ".join(cells) +
                      f" | {r['n_parameters']:,} | {r['inference_s_per_scan']:.2f} |")
+
+    # paired per-scan table (only scans both models were evaluated on)
+    scans = [read_per_scan(p) for p in (path_a, path_b)]
+    shared = sorted(set(scans[0]) & set(scans[1]))
+    metrics = [("Dice", "dice_prostate", ".3f"), ("Apex", "dice_apex", ".3f"), ("Base", "dice_base", ".3f"),
+               ("HD95 (mm)", "hd95_mm", ".1f"), ("Pieces", "prostate_pieces", ".0f")]
+    lines += ["", f"## Paired per-scan comparison ({len(shared)} scans evaluated by both models)", "",
+              "| Case | Week | " + " | ".join(f"{m} {s}" for m, _, _ in metrics for s in short) +
+              f" | Dice {short[1]} - {short[0]} |",
+              "| --- | --- |" + " --- |" * (2 * len(metrics) + 1)]
+    differences = []
+    for case, week in shared:
+        a, b = scans[0][(case, week)], scans[1][(case, week)]
+        cells = [format(as_number(row.get(key)), f) for _, key, f in metrics for row in (a, b)]
+        difference = as_number(b["dice_prostate"]) - as_number(a["dice_prostate"])
+        differences.append(difference)
+        lines.append(f"| {case} | {week} | " + " | ".join(cells).replace("nan", "-") + f" | {difference:+.3f} |")
+    if shared:
+        valid = [d for d in differences if d == d]
+        lines += ["", f"{short[1]} has the higher prostate Dice on {sum(d > 0 for d in valid)} of {len(valid)} scans "
+                      f"(mean difference {sum(valid) / max(len(valid), 1):+.3f})."]
+    missing = (len(scans[0]) - len(shared), len(scans[1]) - len(shared))
+    if any(missing):
+        lines += ["", f"Note: {missing[0]} scans only in {names[0]}, {missing[1]} only in {names[1]} (left out above)."]
+
+    # per patient
+    patients = sorted(set(results[0]["per_patient"]) & set(results[1]["per_patient"]), key=int)
+    lines += ["", "## Per patient (mean over that patient's scans)", "",
+              "| Case | " + " | ".join(f"{m} {s}" for m, _, _ in metrics[:3] for s in short) + " |",
+              "| --- |" + " --- |" * (2 * 3)]
+    for case in patients:
+        cells = [results[k]["per_patient"][case].get(key) for _, key, _ in metrics[:3] for k in (0, 1)]
+        lines.append(f"| {case} | " + " | ".join("-" if v is None else f"{v:.3f}" for v in cells) + " |")
+
+    out = Path(path_a).parent
     table = "\n".join(lines)
-    out = Path(path_a).parent / "comparison.md"
-    out.write_text(table + "\n")
-    print(f"{table}\n\nSaved to {out}")
+    (out / "comparison.md").write_text(table + "\n")
+    profiles = {n: r["slice_profile"] for n, r in zip(names, results) if r.get("slice_profile")}
+    if profiles:
+        profile_comparison_plot(profiles, out / "profile_comparison.png")
+    print(f"{table}\n\nSaved comparison.md and profile_comparison.png to {out}")
 
 # 2D model
 @torch.no_grad()
