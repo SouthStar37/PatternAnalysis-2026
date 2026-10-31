@@ -3,9 +3,12 @@ dataset.py - Data loading, preprocessing, leakage-free splitting and augmentatio
 
 Labels: 0 background, 1 body, 2 bone, 3 bladder, 4 rectum, 5 prostate.
 """
+import hashlib
+import json
 import math
+import os
 import re
-from collections import OrderedDict
+from collections import OrderedDict, defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -14,12 +17,6 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from torch.utils.data import Dataset, WeightedRandomSampler
-
-import hashlib
-import json
-import math
-import re
-from collections import OrderedDict, defaultdict
 
 # SHARED (used by both 2D and 3D)
 
@@ -327,7 +324,7 @@ def load_data_3D(image_names, norm_image=False, dtype=np.float32, get_affines=Fa
         rows, cols, depth = window_size
     images = np.zeros((num, rows, cols, depth), dtype=dtype)
 
-    for i, in_name in enumerate(tqdm(image_names)):
+    for i, in_name in enumerate(image_names):
         nifti_image = nib.load(str(in_name))
         in_image = load_nifti(in_name, is_label=(dtype == np.uint8)) 
         info = {"affine": nifti_image.affine.tolist(), "shape": list(in_image.shape),
@@ -378,8 +375,11 @@ class HipMRIVolumes(Dataset):
         for pair, image_info, label_info in zip(pairs, self.meta, label_meta):
             if image_info["shape"] != label_info["shape"]:
                 raise RuntimeError(f"{pair['id']}: image {image_info['shape']} and label {label_info['shape']} differ")
+        
         if cache is not None:
-            np.savez(cache, images=self.images, labels=self.labels, meta=json.dumps(self.meta))
+            temp = cache.with_name(f"{cache.stem}.{os.getpid()}.tmp.npz") 
+            np.savez(temp, images=self.images, labels=self.labels, meta=json.dumps(self.meta))
+            temp.replace(cache)
 
     def _cache_path(self, cache_dir):
         if not cache_dir:
