@@ -85,12 +85,17 @@ def evaluate_scan(pred, true, spacing, band_fraction=0.2):
     dice, iou = dice_iou(pred, true)
     pred_pro, true_pro = pred == PROSTATE, true == PROSTATE
     hd95, asd = surface_distances(pred_pro, true_pro, spacing)
+    pieces, n_pieces = ndimage.label(pred_pro)
+    sizes = np.bincount(pieces.ravel())[1:]
+    stray_voxels = int(sizes.sum() - sizes.max()) if n_pieces else 0
     row = {f"dice_{n}": float(dice[c]) for c, n in enumerate(CLASS_NAMES)}
     row.update({f"iou_{n}": float(iou[c]) for c, n in enumerate(CLASS_NAMES)})
     row.update(hd95_mm=hd95, asd_mm=asd,
                true_prostate_ml=float(true_pro.sum() * voxel_ml), pred_prostate_ml=float(pred_pro.sum() * voxel_ml),
                leak_rectum_ml=float((pred_pro & (true == RECTUM)).sum() * voxel_ml),
-               leak_bladder_ml=float((pred_pro & (true == BLADDER)).sum() * voxel_ml))
+               leak_bladder_ml=float((pred_pro & (true == BLADDER)).sum() * voxel_ml),
+               prostate_pieces=int(n_pieces), true_prostate_pieces=int(ndimage.label(true_pro)[1]),
+               stray_prostate_ml=float(stray_voxels * voxel_ml))
 
     profile = []
     bands = band_masks(true, band_fraction)
@@ -235,3 +240,25 @@ def profile_plot(profiles, path, n_bins=10):
     fig.savefig(path, dpi=130)
     plt.close(fig)
     return {"position": centres.tolist(), "mean_dice": mean.tolist(), "sd": sd.tolist()}
+
+def profile_comparison_plot(profiles, path):
+    plt = _plt()
+    fig, ax = plt.subplots(figsize=(6.5, 3.6))
+    ax.axvspan(0, 0.2, color="#f9ece7")
+    ax.axvspan(0.8, 1, color="#e7f1fb")
+    for name, profile in profiles.items():
+        position = np.array(profile["position"], dtype=float)
+        mean, sd = np.array(profile["mean_dice"], dtype=float), np.array(profile["sd"], dtype=float)
+        ax.fill_between(position, mean - sd, mean + sd, alpha=0.2)
+        ax.plot(position, mean, marker="o", label=name)
+    ax.text(0.1, 0.03, "apex", ha="center")
+    ax.text(0.9, 0.03, "base", ha="center")
+    ax.set_xlim(0, 1)
+    ax.set_ylim(0, 1)
+    ax.set_xlabel("position along the prostate (0 = apex, 1 = base)")
+    ax.set_ylabel("slice prostate Dice")
+    ax.set_title("Where along the prostate each model fails (mean ± sd over scans)")
+    ax.legend()
+    fig.tight_layout()
+    fig.savefig(path, dpi=130)
+    plt.close(fig)
