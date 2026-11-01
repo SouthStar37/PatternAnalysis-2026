@@ -520,30 +520,96 @@ For a 0.014 gain in prostate Dice, 3D costs 5.7× the training memory and 2.2× 
 
 ## 11. Error Autopsy
 
+The worst test scans of each seed-42 model are shown in Figures 5 and 6 (chosen by `predict.py` as the lowest prostate Dice; each row shows the slice with the most errors). Five failure patterns stand out.
+
+<p align="center">
+  <img src="figures/3d_failure_cases 2.png" width="100%" alt="3D failure cases">
+  <br><em><b>Figure 5.</b> The four worst test scans of the 3D model (seed 42): input, ground truth, prediction and errors (red = missed prostate, blue = false prostate; dashed lines = apex/base band edges). Rows: B040 Week 4, K042, B040 Week 3, B040 Week 2.</em>
+</p>
+
+<p align="center">
+  <img src="figures/2d_failure_cases.png" width="100%" alt="2D failure cases">
+  <br><em><b>Figure 6.</b> The four worst test scans of the 2D model (seed 42), same layout. Rows: B040 Week 3, B040 Week 4, K042, W041.</em>
+</p>
+
 ### 11.1 Case A: 3D Over-segmentation Past the Apex (B040)
 
-### 11.2 Case B: 2D Apex Miss (W041)
+- **What:** 3D predicts too much prostate on **all 7** B040 scans (+0.3 to +5.0 ml), mostly as false prostate (blue) at the lower end (Figure 5, rows 1, 3, 4). Its apex band Dice for B040 drops from 0.795 (2D) to 0.679, while its base improves (0.752 → 0.815, Table 19).
+- **Why (likely):** At the apex the prostate blends into the pelvic floor muscles, which look similar on MRI, and the annotated end of the prostate is partly a judgement call. 3D sees a smooth shape continuing downward and extends it; the slice profile shows 3D is as good as 2D _inside_ the true prostate ([Section 9.5](#95-where-along-the-prostate-each-model-fails)), so the loss comes from the overshoot. 2D also over-segments some B040 scans (Figure 6, rows 1–2), so this patient is hard for both.
+- **Impact:** B040 is 7 of the 9 test scans, so this one patient causes 3D's lower average apex Dice.
+
+### 11.2 Case B: 2D False-positive Ring (W041)
+
+- **What:** 2D draws a ring of false prostate around the true prostate (Figure 6, row 4: 338 false pixels, 0 missed), giving apex Dice 0.577. 3D segments the same scan almost perfectly (Figure 1; Dice 0.903, apex 0.799).
+- **Why (likely):** Seen in one coronal slice, the tissue around the prostate has similar intensity, and 2D cannot check the neighbouring slices to see where the organ ends. 3D can.
+- **Impact:** This is 3D's clearest success, but it is a single scan of a single patient.
 
 ### 11.3 Case C: Large Prostate Under-segmentation (K042)
 
+- **What:** K042 has a 67 ml prostate, twice the dataset median (31 ml). Both models miss part of it (red in Figure 5 row 2 and Figure 6 row 3). 2D predicts 23% too little volume and 3D 8% too little. Both have low apex Dice (0.636 / 0.645), and 3D's base Dice is lower (0.835 → 0.781).
+- **Why (likely):** Few training prostates are this large, so both models learn a typical size and stop short of the true boundary.
+- **Impact:** Scans with unusually large prostates (or other anatomy outside the training range) are **not suitable for unreviewed automation**.
+
 ### 11.4 Case D: Fragmented 2D Predictions
 
-### 11.5 Case E: Rectal Interface Leakage
+- **What:** 2D splits the prostate into **3 separate pieces** on B040 Week 1 and K042. 3D predicts a single piece on every test scan for every seed (Table 16: 1.33 → 1.00 pieces).
+- **Why:** Each 2D slice is segmented independently, so a slice can produce a small speck that its neighbours do not support. 3D sees the whole volume at once.
+- **Impact:** The stray pieces are tiny (0.01 ml on average) and hardly change Dice, but they raise HD95 (K042: 6.1 mm in 2D vs 5.2 in 3D), and a planner would have to find and delete each one by hand.
+
+### 11.5 Case E: Rectal and Bladder Interface Leakage
+
+- **What:** Prostate predicted inside the true **rectum** falls from 0.08 ml (2D) to 0.02 ml (3D), but prostate predicted inside the **bladder** rises from 0.27 to 0.42 ml (Table 16).
+- **Why (likely):** The rectum lies _behind_ the prostate, along the front-back axis, which is across the 2D slices ([Section 12.3](#123-why-coronal-slices-and-missing-front-to-back-context)). The bladder lies _above_ it, along the head-feet axis, which 2D already sees within each slice. The bladder rise may follow from 3D's general over-segmentation of B040 (Case A).
+- **Impact:** Both are under 2% of the prostate volume, but rectal over-contouring is the clinically important direction (radiation proctitis), so 3D's improvement there matters more than its small bladder increase.
 
 ## 12. Discussion: Answering the Research Dilemma
 
+**The question:** does 3D context fix the apex, base, rectum and bladder boundary errors, or does it only smooth the easy central slices at several times the GPU cost? **The answer is in between:** 3D improves the _shape_ and the rectal boundary, but it does **not** fix the apex, and its overall gain is modest.
+
 ### 12.1 Where 3D Context Helps
+
+- **Consistently, for every seed and every patient:** prostate Dice +0.014, and the central prostate +0.022.
+- **More reliable shapes:** no fragments (1.33 → 1.00 pieces), HD95 4.02 → 3.20 mm with less spread, so the worst errors are smaller.
+- **Rectal boundary:** leakage into the rectum falls fourfold (0.08 → 0.02 ml).
+- **Cases that defeat 2D:** W041 (ring of false prostate) and B040 Week 3 (+0.058 Dice).
 
 ### 12.2 Where It Breaks Down
 
+- **The apex is not fixed.** Apex Dice is slightly worse in 3D (0.712 vs 0.735), because 3D draws past the true apex on B040 (Case A).
+- **The base gain is uncertain.** +0.014 on average, but ± 0.045 across seeds, and lower than 2D for K042.
+- **Large prostates are still under-segmented** by both models (Case C).
+- **Bladder leakage rises slightly** (0.27 → 0.42 ml).
+
 ### 12.3 Why: Coronal Slices and Missing Front-to-Back Context
+
+The research question assumed that 2D lacks _head-feet_ context, which is true for the usual **axial** slices. The HipMRI 2D slices are **coronal** ([Section 6.3](#63-verifying-the-patient-match)): each slice already runs from head to feet, so the 2D model _does_ see the apex and base in its slice, with the bladder above. What 2D cannot see is the **front-back** direction, across slices. This explains the pattern of results:
+
+- **Apex and base** lie along an axis 2D already sees, so 3D has little to add, and the apex errors that remain come from the ambiguous apex anatomy and labels, which no amount of context fixes.
+- **The rectum** lies behind the prostate, across the 2D slices, so this is where 3D context helps most (fourfold less leakage).
+- **Fragments and rings** come from segmenting slices independently, which 3D removes by design.
+
+So 3D context fixes the errors along the axis 2D was blind to, and not the ones the research question expected.
 
 ### 12.4 Limitations
 
+- **Three test patients, one dominant.** B040 is 7 of 9 test scans, so the apex result largely describes one patient. Small differences (e.g. the base gain) are within seed variation and inconclusive.
+- **Only 3D was tuned.** All seven 3D settings beat 2D on validation, including the untuned one, so the conclusion stands, but 2D might gain a little from tuning too.
+- **Per-scan tables use seed 42 only.** The seed-averaged results (Table 16) agree with them.
+- **One dataset from one source.** Performance on other scanners or hospitals is untested.
+- **No resampling to equal voxel spacing.** Spacing varies little (1.41–1.88 mm), but this was not tested.
+- **The causes in Section 11 are likely explanations**, based on the figures and volume checks, not on controlled experiments.
+
 ## 13. Recommendation to the Project Manager
 
-## 14. Future Work
+**Adopt the 3D Improved U-Net as a contour-drafting assistant**
 
-## 15. References
+1. **Use 3D, not 2D.** It is better on every patient and seed, makes no fragmented contours, leaks less into the rectum, and runs as fast (0.05 s per scan). Its extra cost is training only (3.9 GB GPU memory, about 30 minutes), affordable on any modern GPU.
+2. **Always have the apex reviewed.** Neither model is reliable in the bottom 20% of the prostate (Dice ≈ 0.71–0.74), and 3D tends to draw past the apex. The planner should check and correct the apex on every scan.
+3. **Flag scans that need full manual contouring:** a predicted prostate volume far from the typical range (K042: 67 ml was under-contoured by 8%), or a prediction in more than one piece.
+4. The next gain in perfromance needs **more patients**, especially more test patients, so the apex result can be confirmed beyond B040.
 
-## 16. Artificial Intelligence Usage Disclosure
+**Expected outcome:** drafts that need correction mainly at the apex, saving most of the contouring time on the central prostate, which both models segment at Dice ≈ 0.9 or better.
+
+## 14. References
+
+## 15. Artificial Intelligence Usage Disclosure
