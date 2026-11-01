@@ -27,7 +27,9 @@ import json
 import random
 import time
 from pathlib import Path
+
 import matplotlib
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
@@ -245,9 +247,6 @@ def test_best(model, out, make_test_loader, loss_fn, device, use_amp, best_epoch
 # Outputs
 def plot_curves(history, path, target):
     """Left: training vs validation loss. Right: validation Dice per class (prostate in bold)."""
-    
-    matplotlib.use("Agg")
-    
     epochs = [row["epoch"] for row in history]
     fig, (ax_loss, ax_dice) = plt.subplots(1, 2, figsize=(11, 4))
     ax_loss.plot(epochs, [row["train_loss"] for row in history], label="train")
