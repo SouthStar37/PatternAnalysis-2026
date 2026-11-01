@@ -131,21 +131,120 @@ The 2D and 3D models share loss, metrics and test patients, so differences come 
 
 ### 3.1 Files
 
-### 3.2 Quick Start
+**Table 6.** Files in this repository.
 
-### 3.3 Running on Rangpur
+| File         | Purpose                                                                                                                                                                                           |
+| ------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `dataset.py` | Data loading, pre-processing, patient-level splitting and augmentation for the 2D slices and 3D volumes ([Section 5](#5-data-and-pre-processing), [Section 6](#6-train--validation--test-splits)) |
+| `modules.py` | The 2D and 3D Improved U-Nets, the Dice + cross-entropy loss and the Dice / IoU metric; pure PyTorch ([Section 7](#7-models-and-training))                                                        |
+| `train.py`   | Trains, validates, tests and saves a model; plots the loss and validation Dice curves                                                                                                             |
+| `predict.py` | Loads a trained model, evaluates it per scan, prints the results and saves the figures; `--compare` builds the 2D-vs-3D tables                                                                    |
+| `utils.py`   | Evaluation metrics (Dice, IoU, HD95, apex / middle / base bands, leakage, fragments) and figures, shared by both models                                                                           |
+| `figures/`   | Figures used in this README                                                                                                                                                                       |
 
-### 3.4 Outputs
+### 3.2 How to Use the Files
 
-### 3.5 Testing
+The data folder is set by `DATA_ROOT` at the top of `dataset.py` (default: the HipMRI copy on Rangpur, `/home/groups/comp3710/HipMRI_Study_open`). There are two steps: **train** a model with `train.py`, then **evaluate** it with `predict.py`.
+
+#### Step 1: Train
+
+```bash
+python train.py --dim 2d # 2D baseline, default settings
+python train.py --dim 3d --lr 5e-4 --epochs 300 --patience 60 --dice-weight 2 --out runs/3d_final_seed42 # final 3D model
+```
+
+**Table 7.** `train.py` options.
+
+| Option          | Default                                | What it does                                                                |
+| --------------- | -------------------------------------- | --------------------------------------------------------------------------- |
+| `--dim`         | `2d`                                   | Which model to train: `2d` or `3d`                                          |
+| `--out`         | `runs/improved2d` or `runs/improved3d` | Folder for this run's outputs (use a new name per experiment)               |
+| `--epochs`      | 60 (2D), 150 (3D)                      | Maximum number of epochs                                                    |
+| `--patience`    | 12 (2D), 30 (3D)                       | Stop early after this many epochs without a better validation prostate Dice |
+| `--lr`          | `5e-4`                                 | Starting learning rate (decays to 1% of it)                                 |
+| `--dice-weight` | `1.0`                                  | Loss = dice-weight × Dice loss + cross-entropy                              |
+| `--seed`        | `42`                                   | Random seed                                                                 |
+| `--max-scans`   | all                                    | Use only N scans per split, for a quick test                                |
+
+All other settings (filters, dropout, weight decay, batch size, augmentation) are fixed in `SETTINGS` at the top of `train.py` and saved with every run.
+
+#### Step 2: Evaluate
+
+```bash
+python predict.py --checkpoint runs/3d_final_seed42/best.pt # test split
+python predict.py --checkpoint runs/3d_final_seed42/best.pt --split validate
+python predict.py --compare runs/improved2d/eval_test/results.json runs/3d_final_seed42/eval_test/results.json
+```
+
+**Table 8.** `predict.py` options.
+
+| Option          | Default    | What it does                                                                         |
+| --------------- | ---------- | ------------------------------------------------------------------------------------ |
+| `--checkpoint`  | (required) | The trained model (`best.pt`); its settings and split are read from it               |
+| `--split`       | `test`     | Which split to evaluate: `train`, `validate` or `test`                               |
+| `--max-scans`   | all        | Evaluate only N scans, for a quick test                                              |
+| `--compare A B` |            | Instead of evaluating, compare two `results.json` files scan by scan (e.g. 2D vs 3D) |
+
+Before any long job, the code was checked with unit tests, a short CPU run on a few volumes and a 2-epoch run on Rangpur (`--max-scans 4 --epochs 2`), so bugs were caught in minutes rather than after hours in the queue.
+
+### 3.3 Outputs
+
+**Table 9.** Files written by `train.py` (in `runs/<name>/`) and `predict.py` (in `runs/<name>/eval_<split>/`).
+
+| File                                                 | Contents                                                                                           |
+| ---------------------------------------------------- | -------------------------------------------------------------------------------------------------- |
+| `best.pt`                                            | Weights with the best validation prostate Dice, plus every setting needed to rebuild the model     |
+| `last.pt`                                            | Latest weights, optimiser and scheduler state, used by `--resume`                                  |
+| `config.json`                                        | All settings, the patient split and (3D) the crop position                                         |
+| `history.csv`                                        | Per epoch: losses, validation Dice per class, learning rate, time, peak VRAM                       |
+| `curves.png`                                         | Training and validation loss; validation Dice per class                                            |
+| `test_metrics.json`                                  | Per-class test Dice and IoU of `best.pt`                                                           |
+| `eval_<split>/results.json`                          | Pooled and per-scan summaries, per-patient means, slice profile, inference time and VRAM           |
+| `eval_<split>/per_scan.csv`                          | Every metric for every scan                                                                        |
+| `eval_<split>/failure_cases.png`, `best_case.png`    | Worst / best scans: image, ground truth, prediction, errors                                        |
+| `eval_<split>/band_boxplot.png`, `slice_profile.png` | Apex / middle / base Dice per scan; Dice along the prostate                                        |
+| `comparison.md`, `profile_comparison.png`            | From `--compare`: summary, paired per-scan and per-patient tables; both slice profiles on one plot |
 
 ## 4. Dependencies and Reproducibility
 
 ### 4.1 Dependencies
 
+**Table 10.** Software versions used for all results.
+
+| Package    | Version | Used for                                                   |
+| ---------- | ------- | ---------------------------------------------------------- |
+| Python     | 3.11.16 |                                                            |
+| PyTorch    | 2.14.0  | Models, training                                           |
+| NumPy      | 2.4.6   | Data loading and evaluation                                |
+| nibabel    | 5.4.2   | Reading the NIfTI scans                                    |
+| SciPy      | 1.17.1  | HD95 / surface distances and connected pieces (`utils.py`) |
+| Matplotlib | 3.11.2  | Curves and figures                                         |
+
+```bash
+pip install torch==2.14.0 numpy==2.4.6 nibabel==5.4.2 scipy==1.17.1 matplotlib==3.11.2
+```
+
 ### 4.2 Hardware
 
+All training and evaluation ran on the UQ Rangpur cluster on an **NVIDIA A100-PCIE-40GB** GPU. Tests and local checks ran on a laptop CPU.
+
 ### 4.3 Reproducibility
+
+- **Fixed seeds.** `--seed`, which fix the initial weights, data order, random crops and augmentation.
+- **Deterministic data.** The patient split is read from the provided 2D folders, and the 3D crop centre is computed from the training labels, so both are identical in every run.
+
+Exact commands that produced the final models (run once per seed: 42, 1, 2):
+
+```bash
+# 2D Improved U-Net
+python train.py --dim 2d --seed <seed> --out runs/improved2d_seed<seed>
+
+# 3D Improved U-Net
+python train.py --dim 3d --lr 5e-4 --epochs 300 --patience 60 --dice-weight 2 --seed <seed> --out runs/3d_final_seed<seed>
+
+# evaluate each run on the test split
+python predict.py --checkpoint runs/<name>/best.pt
+```
 
 ## 5. Data and Pre-processing
 
