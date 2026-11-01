@@ -250,23 +250,82 @@ python predict.py --checkpoint runs/<name>/best.pt
 
 ### 5.1 Dataset
 
-### 5.2 Data Audit
+The HipMRI Study data contain pelvic MR scans of 38 prostate cancer patients, taken weekly during radiotherapy (1–8 scans per patient). Every scan is labelled with six classes: 0 background, 1 body, 2 bone, 3 bladder, 4 rectum, 5 prostate. Two versions of the same scans are used:
 
-### 5.3 2D Pre-processing
+- **2D (`keras_slices_data`):** 60 coronal slices per scan, 256 × 128 pixels, already divided into train / validate / test folders by the course.
+- **3D (`semantic_MRs`, `semantic_labels_only`):** 211 whole volumes of 256 × 256 × 128 voxels (left-right × front-back × head-feet, LPS orientation), with about 1.41–1.88 mm in-plane and 1.56 mm slice spacing.
+
+The prostate is tiny: on average 0.10% of a 3D volume (8.4–99.4 ml), and present in only about 36% of 2D slices ([Table 4](#23-preliminary-evidence-initial-data-audit)). This class imbalance drives several choices below.
+
+### 5.2 2D Pre-processing
+
+1. **Crop or pad to 256 × 128.** All slices already have this size except one scan's (256 × 144), which is centre-cropped by 8 pixels on each side. Only background is removed.
+2. **Z-score each scan.** MR intensities have no fixed units and vary between scanning sessions, so each scan is rescaled to mean 0 and standard deviation 1. The statistics are taken over all 60 slices of the scan together, so that brightness differences between slices of one scan are kept.
+3. **Oversample prostate slices.** About 64% of slices contain no prostate, so the training sampler draws prostate slices 3 times as often. This shows the network more prostate boundaries per epoch without changing the validation or test data.
 
 ### 5.4 3D Pre-processing
 
+1. **Crop 128 × 128 × 128 around the prostate.** This uses a quarter of the memory of the full 256 × 256 × 128 volume and drops mostly empty space. One fixed crop is used for every scan, centred on the box that holds the prostate of every training volume. Only training labels are used, so nothing about validation or test patients leaks in. The crop spans roughly 18–24 cm, enough for the prostate, bladder and rectum; no true prostate voxel of any test scan falls outside it. The size 128 is divisible by 16, as the network halves the size four times ([Section 7](#7-models-and-training)).
+2. **Keep a margin for random shifts.** Each volume is stored with an extra 16 voxels on each side (padded where the volume ends). Training takes a randomly shifted 128³ crop from this window each time; validation and test always use the fixed central crop.
+3. **Z-score each volume** using the statistics of the central crop only. as the full volume is mostly air, which would distort the mean and standard deviation.
+4. **Keep labels as class numbers.** Listing 2 one-hot encodes labels on loading. They stay one byte per voxel (six times less memory) and are one-hot encoded inside the loss.
+
+Volumes are **not resampled** to equal voxel spacing. Spacing varies little (1.41–1.88 mm), and all distance metrics (HD95, ASD, volumes in ml) use each scan's spacing from its header.
+
 ### 5.5 Data Augmentation
+
+Augmentation is applied on the GPU, to training batches only, with the image and label transformed together.
+
+**Table 12.** Training augmentation.
+
+| Transform                         | 2D                        | 3D                             | Why                                                 |
+| --------------------------------- | ------------------------- | ------------------------------ | --------------------------------------------------- |
+| Rotation                          | ±10°, in the slice plane  | ±10°, about the head-feet axis |                                                     |
+| Scaling                           | 0.9–1.1                   | 0.9–1.1                        | Prostate and patient size vary                      |
+| (rotation and scaling applied to) | 50% of images             | 50% of images                  | Keep half the data unchanged                        |
+| Left-right flip                   | No                        | 50%                            | The pelvis is nearly symmetric left-right           |
+| Random 128³ crop position         | n/a                       | ±16 voxels                     | Model doesn't rely on the prostate's exact position |
+| Brightness / contrast / noise     | ±0.1 / 0.9–1.1 / σ = 0.03 | same                           | Intensity differences between sessions              |
+
+In 3D, the axes are known, so flips are only left-right and rotations are only about the head-feet axis. This keeps the bladder above the prostate and the rectum behind it, as in every real scan. The 2D slices carry no orientation information, so they are not flipped.
 
 ## 6. Train / Validation / Test Splits
 
 ### 6.1 2D Split
 
+The 2D baseline uses the train / validate / test folders provided with the data. The split is by patient: 31 / 4 / 3 patients.
+
 ### 6.2 3D Split Matched to 2D
+
+The 3D volumes come without a split. A random 70 / 15 / 15 split would be patient-level but would test the two models on **different patients**, so any difference could come from the patients rather than from 2D versus 3D. Instead, each 3D patient is put in the same set as its 2D case. The 3D patient number is the 2D case number (`B040` ↔ `case_040`).
+
+- **Both models are tested on the same 9 scans of the same 3 patients**, so they can be compared scan by scan ([Section 9](#9-results-2d-baseline-vs-3d)).
+- **The 3D model has no extra information.** Its training patients are the same 2D training patients.
 
 ### 6.3 Verifying the Patient Match
 
+Matching by number assumes the 2D and 3D data number patients the same way. Because the whole comparison rests on this, it was checked directly with a short local script. For every validation and test scan, the 3 2D label slices with the most prostate were compared with every slice of the 3D label volume of the same patient and week (also trying flipped and transposed versions), and with the 3D labels of a different patient as a control.
+
+- **20 / 20 scans** contain a (near-)identical slice in their own 3D volume.
+- The matching 3D slice is always along the **front-back axis**, at the 2D slice number + 98. This shows that the 2D data are coronal slices cut from the same volumes, and that the 3D labels are the same annotations.
+
+The 2D and 3D results therefore come from the same patients, scans and labels.
+
 ### 6.4 Split Sizes and Limitations
+
+**Table 13.** Split sizes, from the provided 2D folders (identical for both models).
+
+| Split    | Patients | 3D scans | 2D slices | Share of scans | Patients (scans)                       |
+| -------- | -------- | -------- | --------- | -------------- | -------------------------------------- |
+| Train    | 31       | 191      | 11,460    | 90.5%          |                                        |
+| Validate | 4        | 11       | 660       | 5.2%           | R039 (8), B037 (1), B038 (1), M036 (1) |
+| Test     | 3        | 9        | 540       | 4.3%           | B040 (7), K042 (1), W041 (1)           |
+
+The provided split is roughly 90 / 5 / 5 by scans. Giving most data to training suits a small dataset of 38 patients, since each extra training patient adds anatomical variation. The cost is a small and uneven validation and test set, some limitations are:
+
+- Validation is dominated by R039 (8 of 11 scans), and test by B040 (7 of 9). A mean over scans mostly measures these two patients, so results are also reported per patient ([Section 9.4](#94-per-patient-results)), and B040 is analysed separately ([Section 11](#11-error-autopsy)).
+- Three test patients cannot show small differences reliably.
+- A larger or re-balanced split would break the identical comparison with the 2D baseline.
 
 ## 7. Models and Training
 
