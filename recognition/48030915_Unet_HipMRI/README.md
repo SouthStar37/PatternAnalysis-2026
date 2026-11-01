@@ -331,29 +331,192 @@ The provided split is roughly 90 / 5 / 5 by scans. Giving most data to training 
 
 ### 7.1 Architecture
 
+Both models are the Improved U-Net of Isensee et al., built in `modules.py` from the same four building blocks. Each block takes `dims` (2 or 3) and only swaps the layer types (`Conv2d` ↔ `Conv3d`, `InstanceNorm2d` ↔ `InstanceNorm3d`, bilinear ↔ trilinear), so the two networks are identical except for the spatial dimension.
+
+- **Encoder (5 levels, 16 → 256 channels).** Each level halves the resolution with a stride-2 3×3 convolution, then applies a context module: a residual unit of two 3×3 convolutions with dropout (p = 0.3) between them, added back to its input.
+- **Decoder.** Each level doubles the resolution with an upsampling module (nearest-neighbour upsampling, then a 3×3 convolution, which avoids the checkerboard artefacts of transposed convolutions). It joins the encoder output of the same level (skip connection), then refines it with a localisation module (3×3 then 1×1 convolution).
+- **Deep supervision.** Segmentation maps from the two coarser decoder levels are upscaled and added to the final one, so the deeper layers also learn to segment directly.
+- **Throughout:** instance normalisation (suits batch sizes of 2) and leaky ReLU (slope 0.01).
+
+The output is 6 score maps (one per class), at the input's size.
+
 ### 7.2 Choice of Baseline
+
+The baseline is the 2D Improved U-Net. If the baseline were a different architecture, a difference in results could come from the architecture or from the third dimension, and the two could not be separated. With the same network in 2D and 3D, the comparison answers the research question directly.
 
 ### 7.3 Loss Function
 
+Loss = **cross-entropy + w × (1 − mean soft Dice)**, with w = 1 for 2D and w = 2 for the final 3D model ([Section 8](#8-hyperparameter-tuning-3d)).
+
+- **Cross-entropy** scores every voxel, which gives stable gradients from the start, but on its own it can score well while ignoring the prostate, which is about 0.1% of the voxels.
+- **Soft Dice** measures overlap per class, so the small prostate counts as much as the large body. It is averaged over the foreground classes present in the batch, as an absent class has no meaningful Dice (cross-entropy still penalises predicting it).
+- Labels are one-hot encoded inside the loss, on the GPU ([Section 5.3](#53-3d-pre-processing)).
+
 ### 7.4 Training Settings
+
+**Table 14.** Training settings (fixed in `train.py`; only learning rate, Dice weight, epochs and patience were tuned).
+
+| Setting                                  | 2D                                                    | 3D (final)                        |
+| ---------------------------------------- | ----------------------------------------------------- | --------------------------------- |
+| Input, batch size                        | 256 × 128 slices, 16                                  | 128³ crops, 2                     |
+| Optimiser                                | AdamW, weight decay 1e-5                              | same                              |
+| Learning rate                            | 5e-4, cosine decay to 1% over the maximum epochs      | same                              |
+| Loss                                     | CE + 1 × Dice                                         | CE + 2 × Dice                     |
+| Maximum epochs / early-stopping patience | 60 / 12                                               | 300 / 60                          |
+| Model selection                          | Best validation **prostate** Dice (`best.pt`)         | same                              |
+| Precision                                | Mixed (float16), on an A100                           | same                              |
+| Augmentation, sampling                   | [Table 12](#54-data-augmentation); prostate slices 3× | [Table 12](#54-data-augmentation) |
+
+The checkpoint is chosen on the validation prostate Dice rather than the loss. Prostate overlap is the quantity the project is about, and the loss also rewards the large, easy classes.
 
 ### 7.5 Training Curves
 
+<p align="center">
+  <img src="figures/2d_curves.png" width="100%" alt="2D training curves">
+  <img src="figures/3d_curves.png" width="100%" alt="3D training curves">
+  <br><em><b>Figure 2.</b> Loss (left of each panel) and validation Dice per class (right) for the 2D model (top panel; seed 42, stopped at epoch 32, best epoch 20) and the 3D model (bottom panel; seed 42, stopped at epoch 180).</em>
+</p>
+
+Both models reach most of their final validation Dice within about 20 epochs, then improve slowly. Three things explain the fast plateau:
+
+- **Dense supervision.** Every voxel is a training example, so even one epoch provides millions of labelled prostate boundary voxels.
+- **A ceiling from the labels.** The prostate boundary, especially at the apex, is ambiguous on MRI and is drawn slightly differently from scan to scan, which limits how high any model can score.
+- **A small validation set.** With 11 scans (8 from one patient), the curves oscillate, most visibly for the bladder, whose filling varies from week to week.
+
+The training loss keeps falling while the validation loss stays flat, which shows mild overfitting. Early stopping on the validation prostate Dice ends training once it stops improving, and the best checkpoint is kept.
+
 ## 8. Hyperparameter Tuning (3D)
+
+Seven different settings were compared, each trained once (seed 42). They varied the learning rate, the Dice weight and the training length.
+
+**Table 15.** 3D tuning runs, ranked by validation prostate Dice. Test results were never used for any choice.
+
+| Run                 | LR   | Max epochs / patience | Dice weight | Val prostate Dice | Best epoch | Val apex / middle / base      | Val HD95 (mm) |
+| ------------------- | ---- | --------------------- | ----------- | ----------------- | ---------- | ----------------------------- | ------------- |
+| **e6** dice 2, long | 5e-4 | 300 / 60              | 2           | **0.868**         | 44         | **0.820** / 0.889 / **0.714** | **3.12**      |
+| e2 lr 1e-3          | 1e-3 | 150 / 30              | 1           | 0.867             | 22         | 0.765 / 0.892 / 0.696         | 3.36          |
+| e4 long             | 5e-4 | 300 / 60              | 1           | 0.861             | 79         | 0.784 / 0.873 / 0.719         | 3.36          |
+| e3 lr 2e-4          | 2e-4 | 150 / 30              | 1           | 0.860             | 22         | 0.784 / 0.881 / 0.704         | 3.58          |
+| e7 lr 2e-4, long    | 2e-4 | 300 / 60              | 1           | 0.858             | 55         | 0.802 / 0.880 / 0.711         | 3.82          |
+| e1 base             | 5e-4 | 150 / 30              | 1           | 0.858             | 45         | 0.764 / 0.866 / 0.696         | 3.52          |
+| e5 dice 2           | 5e-4 | 150 / 30              | 2           | 0.857             | 44         | 0.809 / 0.880 / 0.682         | 3.36          |
+
+**Chosen: expereiment 6** (learning rate 5e-4, Dice weight 2, up to 300 epochs with patience 60). It had the best validation prostate Dice, and also the best apex Dice and HD95, the boundary measures this project is about.
+
+- **Every 3D run, including the untuned e1, beat the 2D model's validation Dice (0.846).** The 3D gain therefore does not come from tuning.
+- Early stopping ended e6 at epoch 104. The longer patience (60) stops the noisy validation curve from ending training too early.
 
 ## 9. Results: 2D Baseline vs 3D
 
+All results are on the **same 9 test scans of 3 patients** for both models, evaluated per whole scan with the same code. Unless stated otherwise, values are the mean ± sd over three training seeds (42, 1, 2).
+
 ### 9.1 Overall Results
+
+**Table 16.** Test results.
+
+| Metric                                      | 2D Improved U-Net | 3D Improved U-Net | Better         |
+| ------------------------------------------- | ----------------- | ----------------- | -------------- |
+| Prostate Dice (pooled over all test voxels) | 0.862 ± 0.008     | **0.876 ± 0.005** | 3D             |
+| Prostate Dice (mean per scan)               | 0.864 ± 0.006     | **0.879 ± 0.007** | 3D             |
+| Apex Dice (bottom 20%)                      | **0.735 ± 0.026** | 0.712 ± 0.032     | 2D             |
+| Middle Dice                                 | 0.895 ± 0.004     | **0.917 ± 0.006** | 3D             |
+| Base Dice (top 20%)                         | 0.772 ± 0.013     | **0.786 ± 0.045** | 3D (uncertain) |
+| HD95, median (mm)                           | 4.02 ± 0.59       | **3.20 ± 0.14**   | 3D             |
+| ASD, mean (mm)                              | 1.59 ± 0.10       | **1.48 ± 0.07**   | 3D             |
+| Prostate predicted in rectum (ml)           | 0.08 ± 0.03       | **0.02 ± 0.01**   | 3D             |
+| Prostate predicted in bladder (ml)          | **0.27 ± 0.12**   | 0.42 ± 0.17       | 2D             |
+| Prostate pieces (truth = 1)                 | 1.33 ± 0.11       | **1.00 ± 0.00**   | 3D             |
+
+Both models pass their targets (2D ≥ 0.75, 3D ≥ 0.70) by a wide margin. 3D beat 2D in **all three seed pairs**: 0.876 vs 0.859 (seed 42), 0.871 vs 0.857 (seed 1), 0.881 vs 0.871 (seed 2). The overall gain is small (+0.014) but consistent.
 
 ### 9.2 Per-class Dice and IoU
 
+**Table 17.** Per-class test Dice and IoU.
+
+| Class        | 2D Dice | 2D IoU | 3D Dice   | 3D IoU    |
+| ------------ | ------- | ------ | --------- | --------- |
+| Background   | 0.996   | 0.993  | 0.957     | 0.918     |
+| Body         | 0.985   | 0.971  | 0.985     | 0.971     |
+| Bone         | 0.940   | 0.886  | 0.924     | 0.860     |
+| Bladder      | 0.965   | 0.932  | 0.960     | 0.923     |
+| Rectum       | 0.854   | 0.745  | 0.836     | 0.718     |
+| **Prostate** | 0.862   | 0.758  | **0.876** | **0.779** |
+
+Only the prostate is scored on exactly the same voxels in both models, because the whole prostate lies inside the 3D crop. The other classes are not directly comparable: 2D is scored on whole slices and 3D on the 128³ crop. In particular, 3D background may be lower because the crop leaves out most of the easy air around the body. The bladder and rectum are close in both models.
+
 ### 9.3 Paired Per-scan Comparison
+
+**Table 18.** Prostate results per test scan, seed-42 models.
+
+| Scan        | Dice 2D | Dice 3D | 3D − 2D | Apex 2D | Apex 3D | Base 2D | Base 3D | HD95 2D (mm) | HD95 3D (mm) | Pieces 2D | Pieces 3D |
+| ----------- | ------- | ------- | ------- | ------- | ------- | ------- | ------- | ------------ | ------------ | --------- | --------- |
+| B040 Week 0 | 0.886   | 0.880   | −0.006  | 0.857   | 0.763   | 0.781   | 0.823   | 3.1          | 3.5          | 1         | 1         |
+| B040 Week 1 | 0.875   | 0.891   | +0.015  | 0.861   | 0.680   | 0.768   | 0.761   | 3.1          | 3.1          | 3         | 1         |
+| B040 Week 2 | 0.894   | 0.879   | −0.015  | 0.720   | 0.604   | 0.837   | 0.831   | 3.1          | 3.4          | 1         | 1         |
+| B040 Week 3 | 0.808   | 0.866   | +0.058  | 0.719   | 0.704   | 0.639   | 0.807   | 4.1          | 3.5          | 1         | 1         |
+| B040 Week 4 | 0.820   | 0.845   | +0.025  | 0.802   | 0.654   | 0.679   | 0.798   | 4.9          | 4.6          | 1         | 1         |
+| B040 Week 5 | 0.898   | 0.901   | +0.003  | 0.834   | 0.691   | 0.825   | 0.852   | 2.4          | 3.1          | 1         | 1         |
+| B040 Week 7 | 0.879   | 0.884   | +0.005  | 0.771   | 0.655   | 0.733   | 0.837   | 3.5          | 3.1          | 1         | 1         |
+| W041 Week 0 | 0.854   | 0.903   | +0.049  | 0.577   | 0.799   | 0.838   | 0.792   | 4.7          | 3.1          | 1         | 1         |
+| K042 Week 0 | 0.837   | 0.855   | +0.019  | 0.636   | 0.645   | 0.835   | 0.781   | 6.1          | 5.2          | 3         | 1         |
+
+3D has the higher prostate Dice on **7 of 9 scans** (mean difference +0.017). Its biggest gains are on the scans where 2D is weakest (B040 Week 3: +0.058, W041: +0.049). Its two losses are small (−0.006 and −0.015). Both of 2D's fragmented predictions (3 pieces) become single shapes in 3D.
 
 ### 9.4 Per-patient Results
 
+The test set is dominated by B040 (7 of 9 scans), so a mean over scans mostly describes one patient. Each patient's mean is therefore shown separately.
+
+**Table 19.** Per-patient means, seed-42 models.
+
+| Patient (scans) | Dice 2D | Dice 3D   | Apex 2D   | Apex 3D   | Base 2D   | Base 3D   |
+| --------------- | ------- | --------- | --------- | --------- | --------- | --------- |
+| B040 (7)        | 0.866   | 0.878     | **0.795** | 0.679     | 0.752     | **0.815** |
+| W041 (1)        | 0.854   | **0.903** | 0.577     | **0.799** | **0.838** | 0.792     |
+| K042 (1)        | 0.837   | **0.855** | 0.636     | 0.645     | **0.835** | 0.781     |
+
+3D is better overall for **every patient**, but its boundary changes go in **opposite directions** for different patients. For B040, 3D improves the base and worsens the apex. For W041 it is the reverse, with a large apex gain. The apex and base results in Table 16 are therefore averages of real but patient-specific effects, not one consistent improvement. The causes are examined in [Section 11](#11-error-autopsy).
+
 ### 9.5 Where Along the Prostate Each Model Fails
 
+<p align="center">
+  <img src="figures/profile_comparison.png" width="100%" alt="Slice Dice along the prostate for 2D and 3D">
+  <br><em><b>Figure 3.</b> Prostate Dice along the prostate, from apex (0) to base (1), for both seed-42 models (mean ± sd over the 9 test scans). Only slices inside the true prostate are included. The shaded bands are the apex and base regions.</em>
+</p>
+
+<p align="center">
+  <img src="figures/2d_band_boxplot.png" width="100%" alt="2D band Dice and HD95">
+  <img src="figures/3d_band_boxplot.png" width="100%" alt="3D band Dice and HD95">
+  <br><em><b>Figure 4.</b> Per-scan prostate Dice in the apex, middle and base bands, and HD95, for the 2D (top) and 3D (bottom) seed-42 models. Dashed line: each model's Dice target.</em>
+</p>
+
+- **Both models fail at the ends, not in the middle.** Dice is about 0.9 through the central 60% of the prostate and drops to 0.67–0.78 at the apex and base (Figure 3).
+- **3D improves the middle and slightly the base.** The 3D curve is above the 2D curve from 0.2 to 1.0. The base gain (+0.014) has a large spread over seeds (± 0.045), so it is uncertain.
+- **3D does not fix the apex.** Averaged over seeds, apex band Dice is slightly worse in 3D (0.712 vs 0.735), and both models vary most there (Figure 4).
+- **3D's errors are smaller and more uniform.** HD95 falls from 4.02 to 3.20 mm, and its spread over scans narrows (Figure 4, right panels), because 3D no longer produces stray fragments far from the prostate.
+- **Leakage changes in both directions, and both are small.** Prostate predicted in the rectum falls from 0.08 to 0.02 ml. Prostate predicted in the bladder rises from 0.27 to 0.42 ml. Both are under 2% of a median 31 ml prostate.
+
+The profile and the band Dice measure slightly different things. The profile only covers slices inside the true prostate, while the apex and base bands also count prostate predicted beyond its ends. 3D's apex profile is similar to 2D's, yet its apex band Dice is lower. This points to prediction past the true apex rather than a missed apex ([Section 11](#11-error-autopsy)).
+
 ## 10. Resource Profiling
+
+**Table 20.** Resource use of the two models.
+
+|                             | 2D Improved U-Net | 3D Improved U-Net  | 3D / 2D  |
+| --------------------------- | ----------------- | ------------------ | -------- |
+| Parameters                  | 3,186,370         | 9,462,754          | 3.0×     |
+| Training input (batch)      | 16 × 256 × 128    | 2 × 128³           |          |
+| Peak training VRAM          | 676 MB            | 3,868 MB           | **5.7×** |
+| Peak inference VRAM         | 429 MB            | 811 MB             | 1.9×     |
+| Inference per scan          | 0.049 s           | 0.052 s            | 1.1×     |
+| Epochs trained / best epoch | 32 ± 7 / 20 ± 7   | 128 ± 53 / 68 ± 53 |          |
+| Time per epoch              | 25.8 s            | 14.4 s             | 0.6×     |
+| Training time               | 13.8 ± 3.1 min    | 30.7 ± 12.7 min    | **2.2×** |
+
+- **Memory is the main cost.** 3D needs 5.7× the training memory, but at 3.9 GB it's still enough to make 3D practical.
+- **Inference cost is the same.** Both models segment a scan in about 0.05 s, far below the time a person needs to review the contours, so inference speed does not separate them.
+- **Training takes about twice as long** in 3D, because it needs more epochs. Training time also varies much more between seeds (± 12.7 min), because early stopping ends each run at a different epoch.
+
+For a 0.014 gain in prostate Dice, 3D costs 5.7× the training memory and 2.2× the training time. Its practical value lies less in that gain than in the more reliable shapes: no fragments, a lower HD95, less rectal leakage. This trade-off is weighed in [Section 12](#12-discussion-answering-the-research-dilemma).
 
 ## 11. Error Autopsy
 
