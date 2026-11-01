@@ -1,7 +1,5 @@
 """
-utils.py - Evaluation metrics and figures shared by predict.py for the 2D and 3D models.
-
-Assisted by AI to make code for neat visualisatin and categorisation of results so comaprison is easier
+utils.py - Evaluation metrics and figures used by predict.py for both the 2D and 3D models.
 """
 import csv
 import json
@@ -16,7 +14,7 @@ HEAD_FEET_AXIS = 2
 
 # Metrics
 def dice_iou(pred, true, n_classes=N_CLASSES):
-    """Per-class Dice and IoU for two label maps of any shape. NaN when a class is in neither."""
+    """Per-class Dice and IoU of two label maps of any shape (NaN for a class in neither)."""
     pred, true = np.asarray(pred).ravel(), np.asarray(true).ravel()
     dice, iou = np.full(n_classes, np.nan), np.full(n_classes, np.nan)
     for c in range(n_classes):
@@ -29,17 +27,17 @@ def dice_iou(pred, true, n_classes=N_CLASSES):
 
 
 def surface_distances(pred_mask, true_mask, spacing):
-    """HD95 and average symmetric surface distance (mm) between two boolean masks.
+    """HD95 and average symmetric surface distance (ASD), in mm, between two boolean masks.
 
-    surface = mask minus its erosion (the outermost layer of voxels)
-    For every surface voxel of one mask: distance to the nearest surface voxel of the other
-    (distance_transform_edt with the voxel spacing gives real mm).
-    HD95 = the 95th percentile of those distances (robust version of the worst-case error).
+    Surface = the mask minus its erosion. For every surface voxel of one mask, the distance to the
+    nearest surface voxel of the other is measured with a Euclidean distance transform that uses the
+    voxel spacing. HD95 = the larger of the two directed 95th percentiles (a robust worst-case error).
+
     Returns (None, None) if either mask is empty.
     """
     if not pred_mask.any() or not true_mask.any():
         return None, None
-    # work only on the region around both masks (much faster than the whole block)
+    # only the region around both masks (much faster than the whole block)
     box = tuple(slice(max(a.min() - 2, 0), a.max() + 3) for a in np.nonzero(pred_mask | true_mask))
     pred_mask, true_mask = pred_mask[box], true_mask[box]
     structure = ndimage.generate_binary_structure(3, 1)
@@ -53,12 +51,14 @@ def surface_distances(pred_mask, true_mask, spacing):
 
 
 def band_masks(true_labels, fraction=0.2, axis=HEAD_FEET_AXIS):
-    """Split the head-feet axis into apex / middle / base bands using the TRUE prostate only.
+    """Split the head-feet axis into apex / middle / base bands, using the TRUE prostate only.
 
-    The true prostate spans indices z0..z1 along `axis`. The 20% at the end nearest the bladder
-    is the base, the 20% at the other end is the apex, the rest is the middle. Everything beyond
-    either end belongs to that end's band, so over-shooting predictions are counted there.
-    Returns ([apex, middle, base] masks, base_is_high_end, (z0, z1)) or None without prostate.
+    The true prostate spans indices z0..z1 along `axis`; the `fraction` nearest the bladder is the
+    base, the `fraction` at the other end the apex, the rest the middle. Everything beyond either end
+    belongs to that end's band, so predictions that over-shoot the prostate are counted there.
+
+    Returns ([apex, middle, base] masks broadcastable over the block, base_is_high_end, (z0, z1)),
+    or None if there is no prostate.
     """
     other_axes = tuple(a for a in range(true_labels.ndim) if a != axis)
     prostate_z = np.nonzero((true_labels == PROSTATE).any(axis=other_axes))[0]
@@ -75,19 +75,26 @@ def band_masks(true_labels, fraction=0.2, axis=HEAD_FEET_AXIS):
     apex, base = (low_end, high_end) if base_is_high else (high_end, low_end)
 
     shape = [1] * true_labels.ndim
-    shape[axis] = -1                               # so the 1D masks broadcast over the block
+    shape[axis] = -1
     return [m.reshape(shape) for m in (apex, middle, base)], base_is_high, (z0, z1)
 
 
 def evaluate_scan(pred, true, spacing, band_fraction=0.2):
-    """All metrics for one scan/volume. Returns (row dict, slice profile list)."""
-    voxel_ml = float(np.prod(spacing)) / 1000.0          # mm^3 -> ml
+    """All metrics for one scan. Returns (row dict, slice profile [(position 0=apex..1=base, Dice)]).
+
+    Row: per-class Dice / IoU, prostate HD95 and ASD (mm), true and predicted prostate volume,
+    prostate predicted inside the rectum / bladder (ml), number of separate predicted prostate pieces
+    and the volume outside the largest piece, and apex / middle / base Dice.
+    """
+    voxel_ml = float(np.prod(spacing)) / 1000.0 # mm^3 -> ml
     dice, iou = dice_iou(pred, true)
     pred_pro, true_pro = pred == PROSTATE, true == PROSTATE
     hd95, asd = surface_distances(pred_pro, true_pro, spacing)
+    # separate prostate pieces (the true prostate is one piece): stray blobs and broken-up predictions
     pieces, n_pieces = ndimage.label(pred_pro)
     sizes = np.bincount(pieces.ravel())[1:]
     stray_voxels = int(sizes.sum() - sizes.max()) if n_pieces else 0
+
     row = {f"dice_{n}": float(dice[c]) for c, n in enumerate(CLASS_NAMES)}
     row.update({f"iou_{n}": float(iou[c]) for c, n in enumerate(CLASS_NAMES)})
     row.update(hd95_mm=hd95, asd_mm=asd,
@@ -105,7 +112,7 @@ def evaluate_scan(pred, true, spacing, band_fraction=0.2):
             p, t = pred_pro & mask, true_pro & mask
             total = p.sum() + t.sum()
             row[f"dice_{name}"] = float(2 * (p & t).sum() / total) if total else float("nan")
-        # Dice on every slice across the head-feet axis; position 0 = apex end, 1 = base end
+        # Dice on every slice across the head-feet axis, from the apex end (0) to the base end (1)
         for z in range(z0, z1 + 1):
             p, t = pred_pro[:, :, z], true_pro[:, :, z]
             position = (z - z0) / max(z1 - z0, 1)
@@ -115,7 +122,7 @@ def evaluate_scan(pred, true, spacing, band_fraction=0.2):
 
 
 def summarise(values):
-    """mean / sd / median / min / max of a list, ignoring None and NaN."""
+    """mean / sd / median / min / max / n of a list, ignoring None and NaN (None if nothing is left)."""
     a = np.array([v for v in values if v is not None and not np.isnan(v)], dtype=float)
     if a.size == 0:
         return None
@@ -123,7 +130,9 @@ def summarise(values):
             "min": float(a.min()), "max": float(a.max()), "n": int(a.size)}
 
 
+# Saving
 def write_csv(rows, path):
+    """One row per scan; floats rounded to 4 decimals."""
     fields = list(dict.fromkeys(k for r in rows for k in r))
     with open(path, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fields)
@@ -139,13 +148,13 @@ def save_json(data, path):
 # Figures
 def _plt():
     import matplotlib
-    matplotlib.use("Agg") 
+    matplotlib.use("Agg")
     import matplotlib.pyplot as plt
     return plt
 
 
 def overlay(ax, image, labels, title):
-    """Grey image with coloured labels on top (labels=None -> image only)."""
+    """Grey image with the coloured label map on top (labels=None: image only)."""
     plt = _plt()
     ax.imshow(image, cmap="gray", origin="lower")
     if labels is not None:
@@ -158,8 +167,8 @@ def overlay(ax, image, labels, title):
 def failure_figure(cases, path):
     """One row per case: image | ground truth | prediction | errors (red = missed, blue = false prostate).
 
-    cases: list of dicts with keys title, image, true, pred (2D arrays, already oriented for display),
-           dice, and optional band_lines (row positions of the apex/base band edges).
+    cases: dicts with title, image, true, pred (2D arrays, already oriented for display), dice,
+           and optional band_lines (row positions of the apex/base band edges, drawn dashed).
     """
     plt = _plt()
     fig, axes = plt.subplots(len(cases), 4, figsize=(12, 1.8 * len(cases) + 0.4), squeeze=False)
@@ -170,12 +179,12 @@ def failure_figure(cases, path):
         overlay(row_axes[2], image, pred, f"prediction (scan prostate Dice {case['dice']:.2f})")
         missed = (true == PROSTATE) & (pred != PROSTATE)
         false_pos = (pred == PROSTATE) & (true != PROSTATE)
-        errors = np.zeros(true.shape + (4,))
+        errors = np.zeros(true.shape + (4,))          # RGBA
         errors[missed] = (1, 0.1, 0.1, 0.85)
         errors[false_pos] = (0.1, 0.5, 1, 0.85)
         row_axes[3].imshow(image, cmap="gray", origin="lower")
         row_axes[3].imshow(errors, origin="lower", interpolation="nearest")
-        for y in case.get("band_lines", []):       # dashed lines = edges of the apex/base bands
+        for y in case.get("band_lines", []):
             row_axes[3].axhline(y, color="yellow", ls="--", lw=0.8)
         row_axes[3].set_title(f"red = missed ({missed.sum()} px), blue = false ({false_pos.sum()} px)", fontsize=8)
         row_axes[3].axis("off")
@@ -185,15 +194,15 @@ def failure_figure(cases, path):
 
 
 def band_boxplot(rows, path, target):
-    """Per-scan prostate Dice in each band and for the whole prostate, plus HD95."""
+    """Left: per-scan prostate Dice in each band and overall (every scan a dot). Right: HD95 per scan."""
     plt = _plt()
     fig, (ax_dice, ax_hd) = plt.subplots(1, 2, figsize=(10, 3.8))
     data = [[r[f"dice_{b}"] for r in rows if not np.isnan(r.get(f"dice_{b}", np.nan))] for b in BAND_NAMES]
     data.append([r["dice_prostate"] for r in rows if not np.isnan(r["dice_prostate"])])
     ax_dice.boxplot(data)
     ax_dice.set_xticks(range(1, 5))
-    ax_dice.set_xticklabels(BAND_NAMES + ["whole"])      # (two calls work on older Matplotlib too)
-    for k, values in enumerate(data, 1):         # show every scan as a dot (few test scans)
+    ax_dice.set_xticklabels(BAND_NAMES + ["whole"])
+    for k, values in enumerate(data, 1):
         ax_dice.scatter(np.full(len(values), k) + np.random.uniform(-0.08, 0.08, len(values)), values, s=12, alpha=0.7)
     ax_dice.axhline(target, color="grey", ls="--", lw=1)
     ax_dice.set_ylim(0, 1)
@@ -211,9 +220,36 @@ def band_boxplot(rows, path, target):
     plt.close(fig)
 
 
-def profile_plot(profiles, path, n_bins=10):
-    """Mean +- sd of slice-wise prostate Dice against position from apex (0) to base (1)."""
+def _plot_profiles(curves, path, title):
+    """Draw slice-profile curves {label: {"position", "mean_dice", "sd"}} (mean ± sd band) on one plot."""
     plt = _plt()
+    fig, ax = plt.subplots(figsize=(6.5, 3.6))
+    ax.axvspan(0, 0.2, color="#f9ece7")
+    ax.axvspan(0.8, 1, color="#e7f1fb")
+    for label, curve in curves.items():
+        position = np.array(curve["position"], dtype=float)
+        mean, sd = np.array(curve["mean_dice"], dtype=float), np.array(curve["sd"], dtype=float)
+        ax.fill_between(position, mean - sd, mean + sd, alpha=0.25 if len(curves) == 1 else 0.2)
+        ax.plot(position, mean, marker="o", label=label)
+    ax.text(0.1, 0.03, "apex", ha="center")
+    ax.text(0.9, 0.03, "base", ha="center")
+    ax.set_xlim(0, 1)
+    ax.set_ylim(0, 1)
+    ax.set_xlabel("position along the prostate (0 = apex, 1 = base)")
+    ax.set_ylabel("slice prostate Dice")
+    ax.set_title(title)
+    if len(curves) > 1:
+        ax.legend()
+    fig.tight_layout()
+    fig.savefig(path, dpi=130)
+    plt.close(fig)
+
+
+def profile_plot(profiles, path, n_bins=10):
+    """Slice-wise prostate Dice from apex (0) to base (1): mean ± sd over scans in `n_bins` bins.
+
+    profiles: one evaluate_scan profile per scan. Returns the binned curve (saved in results.json).
+    """
     edges = np.linspace(0, 1, n_bins + 1)
     per_scan = []
     for profile in profiles:
@@ -222,43 +258,12 @@ def profile_plot(profiles, path, n_bins=10):
         bin_of = np.clip(np.digitize(position, edges) - 1, 0, n_bins - 1)
         per_scan.append([dice[bin_of == k].mean() if (bin_of == k).any() else np.nan for k in range(n_bins)])
     per_scan = np.array(per_scan)
-    mean, sd = np.nanmean(per_scan, 0), np.nanstd(per_scan, 0)
-    centres = (edges[:-1] + edges[1:]) / 2
-    fig, ax = plt.subplots(figsize=(6.5, 3.6))
-    ax.axvspan(0, 0.2, color="#f9ece7")
-    ax.axvspan(0.8, 1, color="#e7f1fb")
-    ax.fill_between(centres, mean - sd, mean + sd, alpha=0.25)
-    ax.plot(centres, mean, marker="o")
-    ax.text(0.1, 0.03, "apex", ha="center")
-    ax.text(0.9, 0.03, "base", ha="center")
-    ax.set_xlim(0, 1)
-    ax.set_ylim(0, 1)
-    ax.set_xlabel("position along the prostate (0 = apex, 1 = base)")
-    ax.set_ylabel("slice prostate Dice")
-    ax.set_title(f"Where along the prostate the model fails ({len(profiles)} scans, mean ± sd)")
-    fig.tight_layout()
-    fig.savefig(path, dpi=130)
-    plt.close(fig)
-    return {"position": centres.tolist(), "mean_dice": mean.tolist(), "sd": sd.tolist()}
+    curve = {"position": ((edges[:-1] + edges[1:]) / 2).tolist(),
+             "mean_dice": np.nanmean(per_scan, 0).tolist(), "sd": np.nanstd(per_scan, 0).tolist()}
+    _plot_profiles({"": curve}, path, f"Where along the prostate the model fails ({len(profiles)} scans, mean ± sd)")
+    return curve
 
-def profile_comparison_plot(profiles, path):
-    plt = _plt()
-    fig, ax = plt.subplots(figsize=(6.5, 3.6))
-    ax.axvspan(0, 0.2, color="#f9ece7")
-    ax.axvspan(0.8, 1, color="#e7f1fb")
-    for name, profile in profiles.items():
-        position = np.array(profile["position"], dtype=float)
-        mean, sd = np.array(profile["mean_dice"], dtype=float), np.array(profile["sd"], dtype=float)
-        ax.fill_between(position, mean - sd, mean + sd, alpha=0.2)
-        ax.plot(position, mean, marker="o", label=name)
-    ax.text(0.1, 0.03, "apex", ha="center")
-    ax.text(0.9, 0.03, "base", ha="center")
-    ax.set_xlim(0, 1)
-    ax.set_ylim(0, 1)
-    ax.set_xlabel("position along the prostate (0 = apex, 1 = base)")
-    ax.set_ylabel("slice prostate Dice")
-    ax.set_title("Where along the prostate each model fails (mean ± sd over scans)")
-    ax.legend()
-    fig.tight_layout()
-    fig.savefig(path, dpi=130)
-    plt.close(fig)
+
+def profile_comparison_plot(curves, path):
+    """Several models' binned slice profiles (the "slice_profile" of each results.json) on one plot."""
+    _plot_profiles(curves, path, "Where along the prostate each model fails (mean ± sd over scans)")
