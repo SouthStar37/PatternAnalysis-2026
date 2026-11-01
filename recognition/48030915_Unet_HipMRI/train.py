@@ -1,33 +1,34 @@
 """
-train.py - Training, validation, testing and saving.
+train.py - Train, validate, test and save the 2D or 3D Improved U-Net on HipMRI.
 
-The model comes from modules.py and the data from dataset.py (spec rule). Losses and
-per-class Dice are plotted after every epoch.
+Every epoch: one pass over the training data (with augmentation), validation on held-out patients, 
+checkpointing, and updated loss / Dice curves. The checkpoint with the best validation prostate Dice is kept.
 
 Run:
     python train.py --dim 2d                           # 2D Improved U-Net
-    python train.py --dim 2d --max-scans 4 --epochs 2  # quick test on a few scans
-    python train.py --dim 2d --resume                  # continue after a Rangpur time-out
     python train.py --dim 3d                           # 3D Improved U-Net
-    python train.py --dim 3d --max-scans 4 --epochs 2  # quick 3D test on a few volumes
+    python train.py --dim 3d --max-scans 4 --epochs 2  # quick test on a few volumes
+    python train.py --dim 3d --resume                  # continue after a Rangpur time-out
+    # final 3D settings (chosen on validation):
+    python train.py --dim 3d --lr 5e-4 --epochs 300 --patience 60 --dice-weight 2 --seed 42
 
-Outputs in --out (default runs/improved<dim>, e.g. runs/improved2d):
-    best.pt, last.pt     checkpoints (weights + all settings; last.pt also has the optimiser state)
-    config.json          all settings
+Outputs:
+    best.pt, last.pt     checkpoints (weights + all settings; last.pt also holds the optimiser state)
+    config.json          all settings, the patient split and (3D) the crop position
     history.csv          per epoch: losses, validation Dice per class, learning rate, time, peak VRAM
     curves.png           loss and validation Dice curves
     test_metrics.json    per-class Dice / IoU of best.pt on the test split
 
-Adapted code from Lab demo 2 Unet and online resources
+Main loop and helper functions adapted from the COMP3710 lab demo 2 (U-Net).
 """
-
 import argparse
 import csv
 import json
 import random
 import time
 from pathlib import Path
-
+import matplotlib
+import matplotlib.pyplot as plt
 import numpy as np
 import torch
 from torch.utils.data import DataLoader
@@ -43,27 +44,30 @@ DIM_DEFAULTS = {
 }
 TARGET_DICE = {"2d": 0.75, "3d": 0.70}
 
+# Fixed settings, the same for every run (saved in config.json and the checkpoints)
 SETTINGS = {
     "data_root": DATA_ROOT,    # HipMRI on Rangpur
     "model": "improved",       # Improved U-Net (Isensee et al. 2018)
     "base_filters": 16,        # channels at full resolution, doubled at each level
     "dropout": 0.3,            # in the context modules
-    "weight_decay": 1e-5,
+    "weight_decay": 1e-5,      # AdamW
     "ce_weight": 1.0,          # loss = dice_weight * Dice loss + ce_weight * cross-entropy
     "prostate_weight": 3.0,    # 2D: slices with prostate are drawn this many times more often
     "no_augment": False,
     "no_amp": False,           # mixed precision on the GPU
     "workers": 4,              # data-loading processes
 }
-CACHE_3D = "~/hipmri3d_cache"  # cropped 3D volumes are saved here (about 3 GB), so later runs load in seconds
+CACHE_3D = "~/hipmri3d_cache"
 
-# SHARED
+
+# Setup
 def get_args():
+    """Command-line options, completed with SETTINGS and the per-dimension defaults."""
     ap = argparse.ArgumentParser(description="Train the Improved U-Net on HipMRI")
     ap.add_argument("--dim", default="2d", choices=["2d", "3d"])
     ap.add_argument("--out", default=None)                    # output folder, one per experiment
-    ap.add_argument("--epochs", type=int, default=None)       # default 60 (2D) / 150 (3D)
-    ap.add_argument("--patience", type=int, default=None)     # early stopping, default 12 (2D) / 30 (3D)
+    ap.add_argument("--epochs", type=int, default=None)       # maximum; early stopping usually ends sooner
+    ap.add_argument("--patience", type=int, default=None)     # early stopping: epochs without improvement
     ap.add_argument("--lr", type=float, default=5e-4)         # AdamW learning rate, cosine decay to 1% of it
     ap.add_argument("--dice-weight", type=float, default=1.0) # loss = dice_weight * Dice loss + cross-entropy
     ap.add_argument("--seed", type=int, default=42)           # repeat the final model with other seeds
@@ -72,17 +76,18 @@ def get_args():
     args = ap.parse_args()
 
     vars(args).update(SETTINGS)
-    for key, value in DIM_DEFAULTS[args.dim].items():      # batch size, epochs, patience per --dim
+    for key, value in DIM_DEFAULTS[args.dim].items():
         if getattr(args, key, None) is None:
             setattr(args, key, value)
-    # cache only full 3D runs (a --max-scans test would leave extra cache files behind)
+
     args.cache_dir = CACHE_3D if args.dim == "3d" and not args.max_scans else None
     if args.out is None:
         args.out = f"runs/improved{args.dim}"
     return args
 
+
 def set_seed(seed):
-    """Same seed -> same initial weights, same shuffling, same augmentation: reproducible runs."""
+    """Same seed -> same initial weights, data order and augmentation."""
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -90,12 +95,85 @@ def set_seed(seed):
 
 
 def make_grad_scaler(enabled):
-    """GradScaler for mixed precision (the API moved in newer PyTorch versions)."""
+    """GradScaler for mixed precision."""
     try:
         return torch.amp.GradScaler("cuda", enabled=enabled)
     except (AttributeError, TypeError):
         return torch.cuda.amp.GradScaler(enabled=enabled)
 
+
+# Data
+def build_data_2d(args, pin_memory):
+    """Loaders for the 2D slices with the provided patient-level split.
+
+    Returns (train loader, validation loader, make_test_loader, augment_fn, data_info for config.json).
+    """
+    split = split_cases(args.data_root)
+    counts = check_no_leakage(split)
+    print(f"Patient-level split, no leakage: {counts} cases", flush=True)
+
+    train_ds = HipMRISlices(args.data_root, "train", max_scans=args.max_scans)
+    val_ds = HipMRISlices(args.data_root, "validate", max_scans=args.max_scans)
+    print(train_ds.summary(), "\n" + val_ds.summary(), flush=True)
+
+    sampler = prostate_sampler(train_ds, args.prostate_weight, args.seed) if args.prostate_weight != 1 else None
+    train_loader = DataLoader(train_ds, args.batch_size, sampler=sampler, shuffle=sampler is None,
+                              num_workers=args.workers, pin_memory=pin_memory, drop_last=True)
+    val_loader = DataLoader(val_ds, args.batch_size * 2, shuffle=False,
+                            num_workers=args.workers, pin_memory=pin_memory)
+
+    def make_test_loader():
+        test_ds = HipMRISlices(args.data_root, "test", max_scans=args.max_scans)
+        return test_ds, DataLoader(test_ds, args.batch_size * 2, shuffle=False, num_workers=args.workers)
+
+    augment_fn = None if args.no_augment else augment_2d
+    data_info = {"split_cases": split, "image_shape": list(train_ds.shape)}
+    return train_loader, val_loader, make_test_loader, augment_fn, data_info
+
+
+def build_data_3d(args, pin_memory):
+    """Loaders for the 3D volumes; same return values as build_data_2d.
+
+    1. pair images with labels and split by patient, matching the 2D split (same test patients)
+    2. crop centre from the TRAINING labels only
+    3. training: randomly shifted 128^3 crops + augment_3d; validation/test: the fixed central crop
+    """
+    pairs = list_volume_pairs(args.data_root)
+    by_split, groups, warnings = split_volumes(pairs, args.data_root)
+    counts = check_no_leakage(groups)
+    print(f"Patient-level split matched to 2D, no leakage: {counts} patients, "
+          f"{ {split: len(scans) for split, scans in by_split.items()} } volumes", flush=True)
+    for warning in warnings:
+        print("  note:", warning, flush=True)
+    if args.max_scans:
+        by_split = {split: scans[:args.max_scans] for split, scans in by_split.items()}
+
+    centre, box = crop_centre_from_labels(by_split["train"], workers=args.workers)
+    print(f"Crop centre {centre} (prostate of every training volume lies in {box})", flush=True)
+
+    def volumes(split, train):
+        return HipMRIVolumes(by_split[split], centre, train=train, cache_dir=args.cache_dir)
+
+    train_ds, val_ds = volumes("train", True), volumes("validate", False)
+    print(f"train: {train_ds.summary()}\nvalidate: {val_ds.summary()}", flush=True)
+    train_loader = DataLoader(train_ds, args.batch_size, shuffle=True, num_workers=args.workers,
+                              pin_memory=pin_memory, drop_last=len(train_ds) > args.batch_size)
+    val_loader = DataLoader(val_ds, args.batch_size, shuffle=False, num_workers=args.workers, pin_memory=pin_memory)
+
+    def make_test_loader():
+        test_ds = volumes("test", False)
+        return test_ds, DataLoader(test_ds, args.batch_size, shuffle=False, num_workers=args.workers)
+
+    augment_fn = None if args.no_augment else augment_3d
+    # saved in config.json and every checkpoint, so predict.py evaluates the same scans with the same crop
+    data_info = {"split_patients": groups, "split_scans": {split: [p["id"] for p in scans]
+                                                           for split, scans in by_split.items()},
+                 "split_warnings": warnings, "crop_centre": centre, "crop_size": list(CROP_3D),
+                 "crop_shift": SHIFT_3D, "prostate_box": box, "image_shape": list(CROP_3D)}
+    return train_loader, val_loader, make_test_loader, augment_fn, data_info
+
+
+# Training and evaluation
 def train_one_epoch(model, loader, loss_fn, optimiser, scaler, device, augment_fn=None):
     """One pass over the training data. Returns the mean training loss."""
     model.train()
@@ -110,7 +188,7 @@ def train_one_epoch(model, loader, loss_fn, optimiser, scaler, device, augment_f
         # mixed precision: most maths in float16 on the GPU -> faster and about half the memory
         with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=scaler.is_enabled()):
             loss = loss_fn(model(images), labels)
-        scaler.scale(loss).backward()  # scaling stops tiny float16 gradients becoming 0
+        scaler.scale(loss).backward() # scaling stops tiny float16 gradients becoming 0
         scaler.step(optimiser)
         scaler.update()
 
@@ -121,7 +199,7 @@ def train_one_epoch(model, loader, loss_fn, optimiser, scaler, device, augment_f
 
 @torch.no_grad()
 def evaluate(model, loader, loss_fn, device, use_amp):
-    """Loss and pooled per-class metrics on a validation or test loader. No augmentation, no gradients."""
+    """Mean loss and pooled per-class metrics on a validation or test loader."""
     model.eval()
     metrics = SegMetrics(N_CLASSES)
     total_loss, n_samples = 0.0, 0
@@ -135,12 +213,41 @@ def evaluate(model, loader, loss_fn, device, use_amp):
     return total_loss / n_samples, metrics
 
 
-def plot_curves(history, path, target):
-    """Left: train vs validation loss. Right: validation Dice per class (prostate in bold)."""
-    import matplotlib
-    matplotlib.use("Agg")                       # no screen on Rangpur: draw straight to a file
-    import matplotlib.pyplot as plt
+def resume(path, device, model, optimiser, scheduler, scaler):
+    """Restore a run from last.pt. Returns (history, best_dice, best_epoch, first epoch to train)."""
+    state = torch.load(path, map_location=device, weights_only=False)
+    model.load_state_dict(state["model"])
+    optimiser.load_state_dict(state["optimiser"])
+    scheduler.load_state_dict(state["scheduler"])
+    scaler.load_state_dict(state["scaler"])
+    print(f"Resumed after epoch {state['epoch']} (best prostate Dice {state['best_dice']:.4f} "
+          f"at epoch {state['best_epoch']})", flush=True)
+    return state["history"], state["best_dice"], state["best_epoch"], state["epoch"] + 1
 
+
+def test_best(model, out, make_test_loader, loss_fn, device, use_amp, best_epoch, target):
+    """Evaluate best.pt once on the test split, print per-class Dice / IoU and save test_metrics.json."""
+    test_ds, test_loader = make_test_loader()
+    model.load_state_dict(torch.load(out / "best.pt", map_location=device, weights_only=False)["model"])
+    _, test_metrics = evaluate(model, test_loader, loss_fn, device, use_amp)
+    dice, iou = test_metrics.dice().tolist(), test_metrics.iou().tolist()
+    result = {"best_epoch": best_epoch, "test_set": test_ds.summary(),
+              "dice": dict(zip(CLASS_NAMES, dice)), "iou": dict(zip(CLASS_NAMES, iou))}
+    (out / "test_metrics.json").write_text(json.dumps(result, indent=2))
+
+    print(f"\nTEST ({test_ds.summary()})")
+    for c, name in enumerate(CLASS_NAMES):
+        print(f"  {name:10s} Dice {dice[c]:.4f}   IoU {iou[c]:.4f}")
+    print(f"Prostate Dice {dice[PROSTATE]:.4f}: {'meets' if dice[PROSTATE] >= target else 'below'} "
+          f"the {target} target. Saved to {out}", flush=True)
+
+
+# Outputs
+def plot_curves(history, path, target):
+    """Left: training vs validation loss. Right: validation Dice per class (prostate in bold)."""
+    
+    matplotlib.use("Agg")
+    
     epochs = [row["epoch"] for row in history]
     fig, (ax_loss, ax_dice) = plt.subplots(1, 2, figsize=(11, 4))
     ax_loss.plot(epochs, [row["train_loss"] for row in history], label="train")
@@ -164,77 +271,14 @@ def plot_curves(history, path, target):
 
 
 def write_history(history, path):
+    """One row per epoch as CSV."""
     with open(path, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=list(history[0]))
         writer.writeheader()
         writer.writerows(history)
 
 
-# 2D Improved U-Net
-
-def build_data_2d(args, pin_memory):
-    """Datasets + loaders for the 2D slices, using the provided patient-level split."""
-    split = split_cases(args.data_root)
-    counts = check_no_leakage(split)                 # raises if any case is in two splits
-    print(f"Patient-level split, no leakage: {counts} cases", flush=True)
-
-    train_ds = HipMRISlices(args.data_root, "train", max_scans=args.max_scans)
-    val_ds = HipMRISlices(args.data_root, "validate", max_scans=args.max_scans)
-    print(train_ds.summary(), "\n" + val_ds.summary(), flush=True)
-
-    sampler = prostate_sampler(train_ds, args.prostate_weight, args.seed) if args.prostate_weight != 1 else None
-    train_loader = DataLoader(train_ds, args.batch_size, sampler=sampler, shuffle=sampler is None,
-                              num_workers=args.workers, pin_memory=pin_memory, drop_last=True)
-    val_loader = DataLoader(val_ds, args.batch_size * 2, shuffle=False,
-                            num_workers=args.workers, pin_memory=pin_memory)
-
-    def make_test_loader():                          # loaded only at the end, after training
-        test_ds = HipMRISlices(args.data_root, "test", max_scans=args.max_scans)
-        return test_ds, DataLoader(test_ds, args.batch_size * 2, shuffle=False, num_workers=args.workers)
-
-    augment_fn = None if args.no_augment else augment_2d
-    data_info = {"split_cases": split, "image_shape": list(train_ds.shape)}
-    return train_loader, val_loader, make_test_loader, augment_fn, data_info
-
-
-# 3D Improved U-Net
-def build_data_3d(args, pin_memory):
-
-    pairs = list_volume_pairs(args.data_root)
-    by_split, groups, warnings = split_volumes(pairs, args.data_root)
-    counts = check_no_leakage(groups) 
-    print(f"Patient-level split matched to 2D, no leakage: {counts} patients, "
-          f"{ {split: len(scans) for split, scans in by_split.items()} } volumes", flush=True)
-    for warning in warnings:
-        print("  note:", warning, flush=True)
-    if args.max_scans:
-        by_split = {split: scans[:args.max_scans] for split, scans in by_split.items()}
-
-    centre, box = crop_centre_from_labels(by_split["train"], workers=args.workers)
-    print(f"Crop centre {centre} (prostate of every training volume lies in {box})", flush=True)
-
-    def volumes(split, train):
-        return HipMRIVolumes(by_split[split], centre, train=train, cache_dir=args.cache_dir)
-
-    train_ds, val_ds = volumes("train", True), volumes("validate", False)
-    print(f"train: {train_ds.summary()}\nvalidate: {val_ds.summary()}", flush=True)
-    train_loader = DataLoader(train_ds, args.batch_size, shuffle=True, num_workers=args.workers,
-                              pin_memory=pin_memory, drop_last=len(train_ds) > args.batch_size)
-    val_loader = DataLoader(val_ds, args.batch_size, shuffle=False, num_workers=args.workers, pin_memory=pin_memory)
-
-    def make_test_loader(): 
-        test_ds = volumes("test", False)
-        return test_ds, DataLoader(test_ds, args.batch_size, shuffle=False, num_workers=args.workers)
-
-    augment_fn = None if args.no_augment else augment_3d
-
-    data_info = {"split_patients": groups, "split_scans": {split: [p["id"] for p in scans]
-                                                           for split, scans in by_split.items()},
-                 "split_warnings": warnings, "crop_centre": centre, "crop_size": list(CROP_3D),
-                 "crop_shift": SHIFT_3D, "prostate_box": box, "image_shape": list(CROP_3D)}
-    return train_loader, val_loader, make_test_loader, augment_fn, data_info
-
-
+# Main
 def main():
     args = get_args()
     set_seed(args.seed)
@@ -250,7 +294,7 @@ def main():
     train_loader, val_loader, make_test_loader, augment_fn, data_info = build_data(args, device.type == "cuda")
     print(f"Data ready in {time.time() - start_time:.0f}s", flush=True)
 
-    # model, loss, optimiser, learning-rate schedule
+    # model, loss, optimiser and learning-rate schedule (cosine decay over the full epoch budget)
     dims = 2 if args.dim == "2d" else 3
     model = build_model(args.model, dims, n_classes=N_CLASSES, base_filters=args.base_filters,
                         dropout=args.dropout).to(device)
@@ -261,24 +305,17 @@ def main():
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimiser, T_max=args.epochs, eta_min=args.lr * 0.01)
     scaler = make_grad_scaler(use_amp)
 
+    # everything predict.py needs to rebuild the model and data is stored with the weights
     config = {**vars(args), "dims": dims, "n_classes": N_CLASSES, "n_params": n_params, **data_info}
     (out / "config.json").write_text(json.dumps(config, indent=2))
 
     history, best_dice, best_epoch, first_epoch = [], -1.0, 0, 1
     if args.resume and (out / "last.pt").exists():
-        state = torch.load(out / "last.pt", map_location=device, weights_only=False)
-        model.load_state_dict(state["model"])
-        optimiser.load_state_dict(state["optimiser"])
-        scheduler.load_state_dict(state["scheduler"])
-        scaler.load_state_dict(state["scaler"])
-        history, best_dice, best_epoch = state["history"], state["best_dice"], state["best_epoch"]
-        first_epoch = state["epoch"] + 1
-        print(f"Resumed after epoch {state['epoch']} (best prostate Dice {best_dice:.4f} at epoch {best_epoch})",
-              flush=True)
+        history, best_dice, best_epoch, first_epoch = resume(out / "last.pt", device, model, optimiser,
+                                                             scheduler, scaler)
     if device.type == "cuda":
         torch.cuda.reset_peak_memory_stats()
 
-    # training loop
     for epoch in range(first_epoch, args.epochs + 1):
         epoch_start = time.time()
         train_loss = train_one_epoch(model, train_loader, loss_fn, optimiser, scaler, device, augment_fn)
@@ -294,6 +331,7 @@ def main():
                "peak_vram_mb": torch.cuda.max_memory_allocated() / 2**20 if device.type == "cuda" else 0.0}
         history.append(row)
 
+        # best.pt: best validation prostate Dice so far; last.pt: everything needed to resume
         improved = dice[PROSTATE] > best_dice
         checkpoint = {"model": model.state_dict(), "config": config, "epoch": epoch, "val_dice": dice}
         if improved:
@@ -315,21 +353,7 @@ def main():
     print(f"Best validation prostate Dice {best_dice:.4f} at epoch {best_epoch}. "
           f"Total time {(time.time() - start_time) / 60:.1f} min", flush=True)
 
-    # test the best checkpoint
-    test_ds, test_loader = make_test_loader()
-    model.load_state_dict(torch.load(out / "best.pt", map_location=device, weights_only=False)["model"])
-    _, test_metrics = evaluate(model, test_loader, loss_fn, device, use_amp)
-    dice, iou = test_metrics.dice().tolist(), test_metrics.iou().tolist()
-    result = {"best_epoch": best_epoch, "test_set": test_ds.summary(),
-              "dice": dict(zip(CLASS_NAMES, dice)), "iou": dict(zip(CLASS_NAMES, iou))}
-    (out / "test_metrics.json").write_text(json.dumps(result, indent=2))
-
-    print(f"\nTEST ({test_ds.summary()})")
-    for c, name in enumerate(CLASS_NAMES):
-        print(f"  {name:10s} Dice {dice[c]:.4f}   IoU {iou[c]:.4f}")
-    target = TARGET_DICE[args.dim]
-    print(f"Prostate Dice {dice[PROSTATE]:.4f}: {'meets' if dice[PROSTATE] >= target else 'below'} "
-          f"the {target} target. Saved to {out}", flush=True)
+    test_best(model, out, make_test_loader, loss_fn, device, use_amp, best_epoch, TARGET_DICE[args.dim])
 
 
 if __name__ == "__main__":
