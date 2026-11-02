@@ -92,7 +92,7 @@ Both models go through the same four steps, so any difference in the results com
 | Input        | 256 × 128 slices, z-scored per scan                                     | Fixed 128 × 128 × 128 crop around the pelvis, z-scored per scan |
 | Convolutions | 3 × 3                                                                   | 3 × 3 × 3 (volumetric residual units)                           |
 
-Both follow the Improved U-Net: residual context modules, stride-2 downsampling, instance normalisation, leaky ReLU, localisation modules and deep supervision, trained with Dice + cross-entropy loss.
+Both follow the Improved U-Net (Isensee et al., 2018): residual context modules, stride-2 downsampling, instance normalisation, leaky ReLU, localisation modules and deep supervision, trained with Dice + cross-entropy loss.
 
 - **Encoder–decoder with skip connections** keeps the fine detail needed for millimetre-scale boundaries.
 - **Residual units and deep supervision** help gradients reach early layers in a deep network trained on few patients.
@@ -250,7 +250,7 @@ python predict.py --checkpoint runs/<name>/best.pt
 
 ### 5.1 Dataset
 
-The HipMRI Study data contain pelvic MR scans of 38 prostate cancer patients, taken weekly during radiotherapy (1–8 scans per patient). Every scan is labelled with six classes: 0 background, 1 body, 2 bone, 3 bladder, 4 rectum, 5 prostate. Two versions of the same scans are used:
+The HipMRI Study data (Dowling & Greer, 2021) contain pelvic MR scans of 38 prostate cancer patients, taken weekly during radiotherapy (1–8 scans per patient). Every scan is labelled with six classes: 0 background, 1 body, 2 bone, 3 bladder, 4 rectum, 5 prostate. Two versions of the same scans are used:
 
 - **2D (`keras_slices_data`):** 60 coronal slices per scan, 256 × 128 pixels, already divided into train / validate / test folders by the course.
 - **3D (`semantic_MRs`, `semantic_labels_only`):** 211 whole volumes of 256 × 256 × 128 voxels (left-right × front-back × head-feet, LPS orientation), with about 1.41–1.88 mm in-plane and 1.56 mm slice spacing.
@@ -339,6 +339,8 @@ Both models are the Improved U-Net of Isensee et al., built in `modules.py` from
 - **Throughout:** instance normalisation (suits batch sizes of 2) and leaky ReLU (slope 0.01).
 
 The output is 6 score maps (one per class), at the input's size.
+
+The implementation was also informed by U-Net tutorials and open-source 2D and 3D U-Net code (Chornyi, 2024; GeeksforGeeks, 2025; Guo, 2025; MLearing, n.d.; NVIDIA, 2023; Rehman, 2024).
 
 ### 7.2 Choice of Baseline
 
@@ -535,12 +537,12 @@ The worst test scans of each seed-42 model are shown in Figures 5 and 6 (chosen 
 ### 11.1 Case A: 3D Over-segmentation Past the Apex (B040)
 
 - **What:** 3D predicts too much prostate on **all 7** B040 scans (+0.3 to +5.0 ml), mostly as false prostate (blue) at the lower end (Figure 5, rows 1, 3, 4). Its apex band Dice for B040 drops from 0.795 (2D) to 0.679, while its base improves (0.752 → 0.815, Table 19).
-- **Why (likely):** At the apex the prostate blends into the pelvic floor muscles, which look similar on MRI, and the annotated end of the prostate is partly a judgement call. 3D sees a smooth shape continuing downward and extends it; the slice profile shows 3D is as good as 2D _inside_ the true prostate ([Section 9.5](#95-where-along-the-prostate-each-model-fails)), so the loss comes from the overshoot. 2D also over-segments some B040 scans (Figure 6, rows 1–2), so this patient is hard for both.
+- **Why (likely):** At the apex the prostate blends into the pelvic floor muscles, which look similar on MRI, and the annotated end of the prostate is partly a judgement call. 3D sees a smooth shape continuing downward and extends it. 2D also over-segments some B040 scans (Figure 6, rows 1–2), so this patient is hard for both.
 - **Impact:** B040 is 7 of the 9 test scans, so this one patient causes 3D's lower average apex Dice.
 
 ### 11.2 Case B: 2D False-positive Ring (W041)
 
-- **What:** 2D draws a ring of false prostate around the true prostate (Figure 6, row 4: 338 false pixels, 0 missed), giving apex Dice 0.577. 3D segments the same scan almost perfectly (Figure 1; Dice 0.903, apex 0.799).
+- **What:** 2D draws a ring of false prostate around the true prostate (Figure 6, row 4), giving apex Dice 0.577. 3D segments the same scan almost perfectly (Figure 1; Dice 0.903, apex 0.799).
 - **Why (likely):** Seen in one coronal slice, the tissue around the prostate has similar intensity, and 2D cannot check the neighbouring slices to see where the organ ends. 3D can.
 - **Impact:** This is 3D's clearest success, but it is a single scan of a single patient.
 
@@ -548,7 +550,7 @@ The worst test scans of each seed-42 model are shown in Figures 5 and 6 (chosen 
 
 - **What:** K042 has a 67 ml prostate, twice the dataset median (31 ml). Both models miss part of it (red in Figure 5 row 2 and Figure 6 row 3). 2D predicts 23% too little volume and 3D 8% too little. Both have low apex Dice (0.636 / 0.645), and 3D's base Dice is lower (0.835 → 0.781).
 - **Why (likely):** Few training prostates are this large, so both models learn a typical size and stop short of the true boundary.
-- **Impact:** Scans with unusually large prostates (or other anatomy outside the training range) are **not suitable for unreviewed automation**.
+- **Impact:** Scans with unusually large prostates (or other anatomy outside the training range) are not suitable for unreviewed automation.
 
 ### 11.4 Case D: Fragmented 2D Predictions
 
@@ -558,58 +560,105 @@ The worst test scans of each seed-42 model are shown in Figures 5 and 6 (chosen 
 
 ### 11.5 Case E: Rectal and Bladder Interface Leakage
 
-- **What:** Prostate predicted inside the true **rectum** falls from 0.08 ml (2D) to 0.02 ml (3D), but prostate predicted inside the **bladder** rises from 0.27 to 0.42 ml (Table 16).
-- **Why (likely):** The rectum lies _behind_ the prostate, along the front-back axis, which is across the 2D slices ([Section 12.3](#123-why-coronal-slices-and-missing-front-to-back-context)). The bladder lies _above_ it, along the head-feet axis, which 2D already sees within each slice. The bladder rise may follow from 3D's general over-segmentation of B040 (Case A).
+- **What:** Prostate predicted inside the true rectum falls from 0.08 ml (2D) to 0.02 ml (3D), but prostate predicted inside the **bladder** rises from 0.27 to 0.42 ml (Table 16).
+- **Why (likely):** The rectum lies behind the prostate, along the front-back axis, which is across the 2D slices. The bladder lies above it, along the head-feet axis, which 2D already sees within each slice. The bladder rise may follow from 3D's general over-segmentation of B040 (Case A).
 - **Impact:** Both are under 2% of the prostate volume, but rectal over-contouring is the clinically important direction (radiation proctitis), so 3D's improvement there matters more than its small bladder increase.
 
 ## 12. Discussion: Answering the Research Dilemma
 
-**The question:** does 3D context fix the apex, base, rectum and bladder boundary errors, or does it only smooth the easy central slices at several times the GPU cost? **The answer is in between:** 3D improves the _shape_ and the rectal boundary, but it does **not** fix the apex, and its overall gain is modest.
+**The question:** does 3D context fix the apex, base, rectum and bladder boundary errors, or does it only smooth the easy central slices at several times the GPU cost? **The answer is:** 3D improves the shape and the rectal boundary, but it does not fix the apex, and its overall gain is modest.
 
 ### 12.1 Where 3D Context Helps
 
 - **Consistently, for every seed and every patient:** prostate Dice +0.014, and the central prostate +0.022.
 - **More reliable shapes:** no fragments (1.33 → 1.00 pieces), HD95 4.02 → 3.20 mm with less spread, so the worst errors are smaller.
 - **Rectal boundary:** leakage into the rectum falls fourfold (0.08 → 0.02 ml).
-- **Cases that defeat 2D:** W041 (ring of false prostate) and B040 Week 3 (+0.058 Dice).
+- **Cases that beat 2D:** W041 (ring of false prostate) and B040 Week 3 (+0.058 Dice).
 
 ### 12.2 Where It Breaks Down
 
-- **The apex is not fixed.** Apex Dice is slightly worse in 3D (0.712 vs 0.735), because 3D draws past the true apex on B040 (Case A).
-- **The base gain is uncertain.** +0.014 on average, but ± 0.045 across seeds, and lower than 2D for K042.
+- **The apex:** Apex Dice is slightly worse in 3D (0.712 vs 0.735), because 3D draws past the true apex on B040 (Case A).
+- **The base gain is uncertain:** +0.014 on average, but ± 0.045 across different seeds, and lower than 2D for K042.
 - **Large prostates are still under-segmented** by both models (Case C).
 - **Bladder leakage rises slightly** (0.27 → 0.42 ml).
 
 ### 12.3 Why: Coronal Slices and Missing Front-to-Back Context
 
-The research question assumed that 2D lacks _head-feet_ context, which is true for the usual **axial** slices. The HipMRI 2D slices are **coronal** ([Section 6.3](#63-verifying-the-patient-match)): each slice already runs from head to feet, so the 2D model _does_ see the apex and base in its slice, with the bladder above. What 2D cannot see is the **front-back** direction, across slices. This explains the pattern of results:
+2D models usually segment **axial** slices, which cut across the body from head to feet. Each slice then cannot show where the prostate begins and ends, which is why 3D context is expected to fix the apex and base.
 
-- **Apex and base** lie along an axis 2D already sees, so 3D has little to add, and the apex errors that remain come from the ambiguous apex anatomy and labels, which no amount of context fixes.
-- **The rectum** lies behind the prostate, across the 2D slices, so this is where 3D context helps most (fourfold less leakage).
-- **Fragments and rings** come from segmenting slices independently, which 3D removes by design.
+The HipMRI 2D slices are **coronal** ([Section 6.3](#63-verifying-the-patient-match)), cut from front to back. Each slice already runs from head to feet, so the 2D model sees the apex, the base and the bladder above within a single slice. What it cannot see is the **front-back** direction, which is spread across slices. This explains where 3D helped and where it did not:
 
-So 3D context fixes the errors along the axis 2D was blind to, and not the ones the research question expected.
+- **Apex and base** are visible to 2D within each slice, so 3D adds little there. The remaining apex errors more likely come from the apex itself being hard to see and to label (Case A, [Section 11.1](#111-case-a-3d-over-segmentation-past-the-apex-b040)).
+- **The rectum** lies behind the prostate, so the boundary runs across the 2D slices. This is where 3D helps most, leakage into the rectum falls from 0.08 to 0.02 ml.
+- **Fragments and rings** come from segmenting each slice on its own, which 3D avoids by seeing the whole volume.
+
+3D context mainly fixes errors in the direction the 2D slices could not see, rather than at the apex and base.
 
 ### 12.4 Limitations
 
 - **Three test patients, one dominant.** B040 is 7 of 9 test scans, so the apex result largely describes one patient. Small differences (e.g. the base gain) are within seed variation and inconclusive.
+- **A small, uneven validation set.** Model selection and tuning relied on 11 scans from 4 patients, 8 of them from R039. The validation curves oscillate (Figure 2), the seven tuning runs differ by only 0.011, and the chosen checkpoint and settings may partly fit R039 rather than patients in general.
 - **Only 3D was tuned.** All seven 3D settings beat 2D on validation, including the untuned one, so the conclusion stands, but 2D might gain a little from tuning too.
-- **Per-scan tables use seed 42 only.** The seed-averaged results (Table 16) agree with them.
 - **One dataset from one source.** Performance on other scanners or hospitals is untested.
-- **No resampling to equal voxel spacing.** Spacing varies little (1.41–1.88 mm), but this was not tested.
-- **The causes in Section 11 are likely explanations**, based on the figures and volume checks, not on controlled experiments.
 
 ## 13. Recommendation to the Project Manager
 
-**Adopt the 3D Improved U-Net as a contour-drafting assistant**
+**Adopt the 3D Improved U-Net as a contour-drafting assistant.**
 
-1. **Use 3D, not 2D.** It is better on every patient and seed, makes no fragmented contours, leaks less into the rectum, and runs as fast (0.05 s per scan). Its extra cost is training only (3.9 GB GPU memory, about 30 minutes), affordable on any modern GPU.
+1. **Use 3D, not 2D.** It has higher prostate Dice for every patient and seed, makes no fragmented contours, leaks less into the rectum, and runs as fast (0.05 s per scan). Its extra cost is mainly in training (3.9 GB GPU memory, about 30 minutes), affordable on any modern GPU.
 2. **Always have the apex reviewed.** Neither model is reliable in the bottom 20% of the prostate (Dice ≈ 0.71–0.74), and 3D tends to draw past the apex. The planner should check and correct the apex on every scan.
-3. **Flag scans that need full manual contouring:** a predicted prostate volume far from the typical range (K042: 67 ml was under-contoured by 8%), or a prediction in more than one piece.
-4. The next gain in perfromance needs **more patients**, especially more test patients, so the apex result can be confirmed beyond B040.
+3. **Flag scans for full manual contouring** when the predicted prostate is much larger or smaller than usual (e.g. K042, a 67 ml prostate that was under-contoured by 8%), or when the prediction is in more than one piece.
+4. **Collect more patients data for potential further gains.** Tuning changed validation Dice by only 0.011. More patients, especially more test patients, are needed to improve the model and to confirm the apex result beyond B040.
 
-**Expected outcome:** drafts that need correction mainly at the apex, saving most of the contouring time on the central prostate, which both models segment at Dice ≈ 0.9 or better.
+**Expected outcome:** drafts that need correction mainly at the apex. The central prostate, which 3D segments at Dice 0.92, should need little editing, saving much of the manual contouring time.
 
 ## 14. References
 
+Chornyi, A. (2024). _2D and 3D U-Net architectures_. Retrieved from https://codefinity.com/blog/2D-and-3D-U-Net-Architectures
+
+Dowling, J., & Greer, P. (2021). _Labelled weekly MR images of the male pelvis_. Retrieved from https://doi.org/10.25919/45t8-p065
+
+GeeksforGeeks. (2025). _Unet++ architecture explained_. Retrieved from https://www.geeksforgeeks.org/machine-learning/unet-architecture-explained/
+
+GeeksforGeeks. (2025). _Image segmentation using U-Net_. Retrieved from https://www.geeksforgeeks.org/deep-learning/image-segmentation-using-u-net/
+
+Guo, C. (2025). _3D SA-UNet: 3D spatial attention UNet with 3D atrous spatial pyramid pooling for white matter hyperintensities segmentation_. Retrieved from https://doi.org/10.48550/arXiv.2309.08402
+
+Isensee, F., Jaeger, P. F., Kohl, S. A. A., Petersen, J., & Maier-Hein, K. H. (2021). nnU-Net: A self-configuring method for deep learning-based biomedical image segmentation. _Nature Methods, 18_(2), 203–211. https://doi.org/10.1038/s41592-020-01008-z
+
+Isensee, F., Kickingereder, P., Wick, W., Bendszus, M., & Maier-Hein, K. H. (2018). Brain tumor segmentation and radiomics survival prediction: Contribution to the BRATS 2017 challenge, in Brainlesion: Glioma, Multiple Sclerosis, Stroke and TBI Models, 2018, pp. 287–297. https://doi.org/10.1007/978-3-319-75238-9_25
+
+MLearing. (n.d.). _Keras-Brats-Improved-Unet3d_. Retrieved from https://github.com/MLearing/Keras-Brats-Improved-Unet3d
+
+NVIDIA. (2023). _3D-UNet medical image segmentation for TensorFlow_. Retrieved from https://catalog.ngc.nvidia.com/orgs/nvidia/-/resources/unet3d_medical_for_tensorflow
+
+Rehman, A. (2024). _Implement 3D-UNet for Cardiac Volumetric MRI Scans in PyTorch_. Retrieved from https://medium.com/@rehman.aimal/implement-3d-unet-for-cardiac-volumetric-mri-scans-in-pytorch-79f8cca7dc68
+
+Ronneberger, O., Fischer, P., & Brox, T. (2015). U-Net: Convolutional Networks for Biomedical Image Segmentation. Retrieved from https://doi.org/10.1007/978-3-319-24574-4_28
+
 ## 15. Artificial Intelligence Usage Disclosure
+
+**Tool:** Claude (Opus 5.5)
+
+**What it was used for:**
+
+- **Code**
+  - Assist in debugging
+  - Assisted in understanding dataset structure and key info
+  - Suggested the structure of the 3D pipeline
+  - Scaffolding functions' structures
+  - Refactoring long functions
+  - Assisted in writing docstrings and comments for submission
+
+- **Evaluation and figures**
+  - Drafting the metric and figure code in `utils.py` from specifications I set (apex / middle / base bands, leakage, fragment count)
+  - Suggested hyperparameters to try and compare
+
+- **Report**
+  - Assisted in rephrasing sentences for better clarity and coherence
+
+**How outputs were checked:**
+
+- Code tested locally and with smoke tests before full runs
+- Reviewed and edited every function suggested, tested functions with local script before commiting
+- Every number in this README comes from the saved `results.json`, `history.csv` and job logs

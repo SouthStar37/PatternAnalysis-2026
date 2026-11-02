@@ -47,7 +47,7 @@ class ConvNormAct(nn.Sequential):
 
 
 class ContextModule(nn.Module):
-    """Encoder block of [2]: a residual pre-activation unit with dropout between its two 3x3 convolutions.
+    """Encoder block of Improved Unet: a residual pre-activation unit with dropout between its two 3x3 convolutions.
 
     output = x + (norm -> act -> conv -> dropout -> norm -> act -> conv)(x)
     """

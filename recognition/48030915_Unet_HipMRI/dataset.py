@@ -174,7 +174,6 @@ class HipMRISlices(Dataset):
                 f"{self.has_prostate.mean():.1%} slices with prostate, "
                 f"prostate {self.class_fractions()[PROSTATE]:.3%} of pixels")
 
-# leakage-free splitting
 def prostate_sampler(dataset, weight=3.0, seed=0):
     """Sample slices that contain prostate `weight` times more often (only ~36% of slices do)"""
     weights = np.where(dataset.has_prostate, weight, 1.0)
@@ -182,6 +181,7 @@ def prostate_sampler(dataset, weight=3.0, seed=0):
     return WeightedRandomSampler(torch.as_tensor(weights, dtype=torch.double), len(weights), replacement=True,
                                  generator=generator)
 
+# leakage-free splitting
 def split_cases(root=DATA_ROOT):
     """{split: case IDs} of the provided 2D split, read from the filenames"""
     return {split: sorted({parse_key(p.name)[0] for p in (Path(root) / SLICE_DIR / image_dir).glob("*.nii*")})
